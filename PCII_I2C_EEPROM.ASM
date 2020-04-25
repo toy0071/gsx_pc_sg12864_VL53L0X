@@ -1,0 +1,1372 @@
+;===== I2C PAGE MANAGEMENT ========================================
+;	h8/3694
+;				toya@v007.vaio.ne.jp
+;●メモリマップ
+;・ページ情報は、8バイト。ページデータは、120バイト。
+;・ページ情報：1バイト。記録種別（0:空, FF:続き, 1:パワーコマンダー,2:加速度センサー, 4:ラップ, ?:マルチ）
+;              2バイト。一連の前ページ番号。（先頭の場合は0xffff）
+;              2バイト。一連の次ページ番号。（最後の場合は0xffff）
+;■マルチ計測（基本は、1/2s単位）
+;12バイトで1レコード
+;・2bytes: 時刻 min(0..255), s*2(0..120)
+;・2bytes: 加速度x,y
+;・1bytes: 磁気センサー情報
+;・1bytes: アクセル開度
+;・2bytes: 回転数
+;・4bytes: その他4種パワコンデータ
+;10レコード(120bytes)で、1ページ。すなわち、1ページ5秒。
+;■パワーコマンダー(1/5s単位)
+;8バイトで1レコード
+;・2bytes: 回転数
+;・1bytes: アクセル開度
+;・4bytes: その他4種パワコンデータ
+;・1bytes: reserve
+;15レコード(120bytes)で、1ページ。すなわち、1ページ3秒。
+;■加速度センサー(基本は、1/10s単位）
+;6バイトで1レコード
+;・4bytes: 加速度x,y
+;・1bytes: 磁気センサー情報
+;・1bytes: reserve
+;30レコード(120bytes)で、1ページ。すなわち、1ページ3秒。
+;■ラップセンサー(1/1000単位)
+;・2bytes: 秒
+;・2bytes: m秒 0..999
+;・2bytes: SECTOR1 m秒  0.000-59.999
+;・2bytes: SECTOR2 m秒
+;・2bytes: SECTOR3 m秒
+;12レコード(120bytes)で、1ページ。。
+;
+;======================================================
+
+	.FORM	COL=120
+	.PRINT	LIST		;アセンブル時にリストファイルを出力する
+	.CPU 300HN		;ＣＰＵの指定
+
+	.INCLUDE "io.inc"
+	.INCLUDE "PCII.inc"
+
+	.IMPORT		LCD_CHAR
+	.IMPORT		LCD_OFFSET
+	.IMPORT		LCD_STRING
+	.IMPORT		LCD_HEXDATA
+	.IMPORT		LCD_TEXT_OFFSET
+	.IMPORT		LCD_DEC_W
+
+	.IMPORT		I2C_START
+	.IMPORT		I2C_STOP
+	.IMPORT		I2C_BUSY_WAIT
+	.IMPORT		I2C_MASTER_SEND
+	.IMPORT		I2C_MASTER_RCV
+	.IMPORT		I2C_WRITE_DATA
+
+	.EXPORT		EEPROM_INIT
+	.EXPORT		EEPROM_READ_PAGE
+	.EXPORT		EEPROM_CHECK_SW1
+	.EXPORT		EEPROM_CHECK_SW2
+	.EXPORT		EEPROM_FIND_PAGE
+	.EXPORT		EEPROM_MEM_INFO
+	.EXPORT		EEPROM_ERASE_PAGE
+	.EXPORT		EEPROM_FORMAT
+	.EXPORT		EEPROM_REC_START
+	.EXPORT		EEPROM_REC_STOP
+	.EXPORT		EEPROM_REC_CHK
+
+	.EXPORT		SET_MEM_G_DATA
+	.EXPORT		SET_MEM_PCII_DATA
+	.EXPORT		SET_MEM_LAP_DATA
+	.EXPORT		SET_MEM_MULTI_DATA
+	.EXPORT		SET_MEM_MULTI_PCII
+
+	.EXPORT		LOAD_PAGE_FROM_EEPROM
+	.EXPORT		GET_DATA_FROM_MEMORY
+
+	.EXPORT		MODE1_PAGE_COUNT
+	.EXPORT		MODE2_PAGE_COUNT
+	.EXPORT		MODE3_PAGE_COUNT
+	.EXPORT		MODE4_PAGE_COUNT
+	.EXPORT		NULL_PAGE_COUNT
+
+	.IMPORT		AX_X			; WORD DATA
+	.IMPORT		AX_Y			; WORD DATA
+
+PLIST_SIZE	.EQU	6
+
+RCVD	.EQU	6	; ICCR1
+RDRF	.EQU	5	; ICSR
+ACKBR	.EQU	1	; ICIER
+ACKBT	.EQU	0	; ICIER
+
+;=================================================
+	.SECTION ROM, CODE, ALIGN=2
+
+;=================================================
+;	24FC512 固有処理
+;	（EEPROM/IICが変わるときはここを変える）
+;------------------------------------------------
+;	IIC/24FC512コマンド処理
+;	NOTE: Every function break R0.
+;------------------------------------------------
+EP24FC512_FLASH_CHK:
+EP24FC512_FLASH_CHK_L1:
+		JSR	@I2C_BUSY_WAIT
+		JSR	@I2C_MASTER_SEND
+		JSR	@I2C_START
+		MOV.B	#B'10100000, R0L	; 24FC512 CONTROL BYTE / SLAVE ADDRESS + W
+		JSR	@I2C_WRITE_DATA
+		STC.B	CCR, R0L
+		PUSH.W	R0
+		JSR	@I2C_STOP
+		POP.W	R0
+		LDC.B	R0L, CCR
+		BNE	EP24FC512_FLASH_CHK_L1	; 1:ACKBR
+		RTS
+
+;------------------------------------------------
+;	送信処理
+;	WORD @MEMORY_ADDRESS : ADDRESS
+;	WORD @RW_LENGTH      : DATA SIZE(BYTE)
+;------------------------------------------------
+EP24FC512_WRITE_PAGE:
+		PUSH.L	ER0
+		PUSH.L	ER1
+		JSR	@I2C_BUSY_WAIT
+		JSR	@I2C_MASTER_SEND
+		JSR	@I2C_START
+		JSR	@EEPROM_SET_ADDRESS
+		BNE	EP24FC512_WRITE_PAGE_ERR
+		MOV.W	@RW_LENGTH, E1
+		BEQ	EP24FC512_WRITE_PAGE_END	; サイズが０の時
+
+		MOV.W	@MEMORY_ADDRESS, R1
+EP24FC512_WRITE_PAGE_L1:
+		MOV.B	@R1, R0L
+		JSR	@I2C_WRITE_DATA
+;		BNE	EP24FC512_WRITE_PAGE_ERR
+		BCS	EP24FC512_WRITE_PAGE_ERR
+		INC.W	#1, R1
+		DEC.W	#1, E1
+		BNE	EP24FC512_WRITE_PAGE_L1
+		JMP	@EP24FC512_WRITE_PAGE_END
+EP24FC512_WRITE_PAGE_ERR:
+		MOV.W	#H'0013, R0
+		JSR	@LCD_OFFSET
+		MOV.B	#H'45, R0L
+		JSR	@LCD_CHAR
+EP24FC512_WRITE_PAGE_END:
+		JSR	@I2C_STOP
+		JSR	@EP24FC512_FLASH_CHK
+		POP.L	ER1
+		POP.L	ER0
+		RTS
+
+;------------------------------------------------
+;	受信処理(必ず2バイト以上)
+;	WORD @I2C_R_ADDRESS : ADDRESS
+;	WORD @I2C_R_LENGTH  : DATA SIZE(BYTE)
+;	BYTE #I2C_R_BLOCK    : DATA SET
+;------------------------------------------------
+EP24FC512_READ_PAGE:
+		PUSH.L	ER0
+		PUSH.L	ER1
+
+		JSR	@I2C_BUSY_WAIT
+		JSR	@I2C_MASTER_SEND
+		JSR	@I2C_START
+		JSR	@EEPROM_SET_ADDRESS
+		BNE	EP24FC512_READ_PAGE_ERR
+		JSR	@I2C_START
+		MOV.B	#B'10100001, R0L	; 24FC512 CONTROL BYTE / SLAVE ADDRESS + R
+		JSR	@I2C_WRITE_DATA
+
+EP24FC512_READ_PAGE_START:
+		MOV.B	@ICCR1, R0L
+		BCLR	#RCVD, R0L		; 受信を継続
+		MOV.B	R0L,@ICCR1
+		MOV.B	@ICIER, R0L
+		BCLR	#ACKBT, R0L		; 受信を継続するときは、ACK=0
+		MOV.B	R0L,@ICIER
+		JSR	@I2C_MASTER_RCV
+		MOV.W	@MEMORY_ADDRESS, R1
+		MOV.W	@RW_LENGTH, E1
+		BEQ	EP24FC512_READ_PAGE_END	; サイズが０の時
+		MOV.B	@ICDRR, R0L		; DUMMY READ
+EP24FC512_READ_PAGE_L1:
+		MOV.B	@ICSR, R0L
+		BTST	#RDRF, R0L		; RDRF(5)
+		BEQ	EP24FC512_READ_PAGE_L1
+		CMP.W	#2,E1			; 1つは受信済みなので、その次の処理
+		BNE	EP24FC512_READ_PAGE_L2	; その次でお終い？
+		MOV.L	#ICCR1, ER0
+		BSET	#RCVD, @ER0		; 次のデータ受信で停止
+		MOV.B	@ICIER, R0L
+		BSET	#ACKBT, R0L		; 受信を終了するときは、ACK=1
+		MOV.B	R0L,@ICIER
+		NOP
+EP24FC512_READ_PAGE_L2:
+		MOV.B	@ICDRR, R0L
+		MOV.B	R0L, @R1
+		INC.W	#1, R1
+		DEC.W	#1, E1
+		BNE	EP24FC512_READ_PAGE_L1
+		JMP	@EP24FC512_READ_PAGE_END
+EP24FC512_READ_PAGE_ERR:
+		MOV.W	#H'0013, R0
+		JSR	@LCD_OFFSET
+		MOV.B	#H'65, R0L
+		JSR	@LCD_CHAR
+EP24FC512_READ_PAGE_END:
+		JSR	@I2C_STOP
+
+		POP.L	ER1
+		POP.L	ER0
+		RTS
+
+;=================================================
+;	EEPROM(FLASHメモリ) 初期化処理
+;	チップ非依存の処理
+;-------------------------------------------------
+EEPROM_INIT:
+		MOV.W	#0, R0
+		MOV.B	R0L, @REC_MODE
+		MOV.B	R0L, @SEMAPHORE
+;		MOV.W	R0, @CURRENT_IIC_PAGE	; CURRENT PAGE の初期化をせずにわざとランダム。
+		JSR	@CREATE_NULLPAGE_LIST
+		RTS
+
+;------------------------------------------------
+;	EEPROM PAGE読みこみ
+;	IN   RO:EEPROM PAGE番号
+;	     R1H:読み込みたいMEMORY PAGE番号(0/1)
+;	     R1L:読み込みバイト数4バイト以上
+;	OUT R0:MEMORY PAGEアドレス
+;------------------------------------------------
+EEPROM_READ_PAGE:
+		PUSH.L	ER1
+		PUSH.L	ER2
+		MOV.W	#MEMORY_PAGE1, R2
+		CMP.B	#0,R1H
+		BEQ	EEPROM_READ_PAGE_L1
+		MOV.W	#MEMORY_PAGE2, R2
+EEPROM_READ_PAGE_L1:
+		MOV.W	R2, E2			; SAVE
+		MOV.W	R2, @MEMORY_ADDRESS
+		MOV.B	#0, R1H
+		BTST	#7, R1L			; 128以上
+		BEQ	EEPROM_READ_PAGE_L2
+		MOV.W	#127, R1
+EEPROM_READ_PAGE_L2:
+		MOV.W	R1, @RW_LENGTH
+		MOV.W	R0, @I2C_PAGE
+		MOV.W	#0, R0
+		MOV.W	R0, @I2C_OFFSET
+		JSR	@EP24FC512_READ_PAGE
+		MOV.W	E2,R0
+		POP.L	ER2
+		POP.L	ER1
+		RTS
+
+;------------------------------------------------
+;	EEPROM PAGE書き込み
+;	IN   RO:EEPROM PAGE番号
+;	     R1H:書き込みたいMEMORY PAGE番号(0/1)
+;	     R1L:書き込み込みバイト数4バイト以上
+;------------------------------------------------
+EEPROM_WRITE_PAGE:
+		PUSH.W	R0
+		PUSH.W	R1
+		PUSH.W	R2
+		MOV.W	#MEMORY_PAGE1, R2
+		CMP.B	#0,R1H
+		BEQ	EEPROM_WRITE_PAGE_L1
+		MOV.W	#MEMORY_PAGE2, R2
+EEPROM_WRITE_PAGE_L1:
+		MOV.W	R2, @MEMORY_ADDRESS
+		MOV.B	#0, R1H
+		BTST	#7, R1L			; 128未満
+		BEQ	EEPROM_WRITE_PAGE_L2
+		MOV.W	#128, R1
+EEPROM_WRITE_PAGE_L2:
+		MOV.W	R1, @RW_LENGTH
+		MOV.W	R0, @I2C_PAGE
+		MOV.W	#0, R0
+		MOV.W	R0, @I2C_OFFSET
+		JSR	@EP24FC512_WRITE_PAGE
+		POP.W	R2
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	EEPROM PAGE読みこみ（呼び出し側でメモリ確保）
+;	IN   RO:EEPROM PAGE番号
+;	     R1:読み込みたいMEMORY PAGE
+;	     R2:読み込みバイト数4バイト以上
+;------------------------------------------------
+EEPROM_READ_PAGE_WM:
+		PUSH.W	R1
+		PUSH.W	R2
+		MOV.W	R1, @MEMORY_ADDRESS
+		MOV.B	#0, R2H
+		BTST	#7, R2L			; 128以上
+		BEQ	EEPROM_READ_PAGE_WM_L1
+		MOV.W	#127, R2
+EEPROM_READ_PAGE_WM_L1:
+		MOV.W	R2, @RW_LENGTH
+		MOV.W	R0, @I2C_PAGE
+		MOV.W	#0, R0
+		MOV.W	R0, @I2C_OFFSET
+		JSR	@EP24FC512_READ_PAGE
+		POP.W	R2
+		POP.W	R1
+		RTS
+
+;------------------------------------------------
+;	EEPROM PAGE書き込み（呼び出し側でメモリ確保）
+;	IN   RO:EEPROM PAGE番号
+;	     R1:書き込みたいMEMORY BLOCK
+;	     R2:バイト数4バイト以上
+;------------------------------------------------
+EEPROM_WRITE_PAGE_WM:
+		PUSH.W	R0
+		PUSH.W	R1
+		PUSH.W	R2
+		MOV.W	R1, @MEMORY_ADDRESS
+		MOV.B	#0, R2H
+		BTST	#7, R2L			; 128未満
+		BEQ	EEPROM_WRITE_PAGE_WM_L1
+		MOV.W	#128, R2
+EEPROM_WRITE_PAGE_WM_L1:
+		MOV.W	R2, @RW_LENGTH
+		MOV.W	R0, @I2C_PAGE
+		MOV.W	#0, R0
+		MOV.W	R0, @I2C_OFFSET
+		JSR	@EP24FC512_WRITE_PAGE
+		POP.W	R2
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	EEPROM TEST
+;------------------------------------------------
+EEPROM_CHECK_SW1:
+		PUSH.L	ER0
+		JSR	@EEPROM_DISP_PAGE
+		MOV.W	@DEBUG_PAGE_NO, R0
+		INC.B	R0L
+		AND.W	#H'000F, R0
+		MOV.W	R0, @DEBUG_PAGE_NO
+		POP.L	ER0
+		RTS
+
+EEPROM_CHECK_SW2:
+		PUSH.L	ER0
+		MOV.W	#H'0, R0
+		MOV.W	R0, @DEBUG_PAGE_NO
+		JSR	@EEPROM_DISP_PAGE
+		POP.L	ER0
+		RTS
+
+;		+01234567890123456789
+;		+----------+---------+
+;		|[I2C/24FC512] P---- |
+;		|XXXX M:XX S:XX I:XX |
+;		|XX XX XX XX XX XX XX|
+;		|YY YY YY YY YY YY YY|
+;		+----------+---------+
+EEPROM_DISP_PAGE:	PUSH.W	R0
+		PUSH.W	R1
+
+		MOV.W	@DEBUG_PAGE_NO, R0
+		MOV.W	R0, @I2C_PAGE
+		MOV.W	#MEMORY_PAGE1, R0
+		MOV.W	R0, @MEMORY_ADDRESS
+		MOV.W	#127, R0
+		MOV.W	R0, @RW_LENGTH
+		MOV.W	#0, R0
+		MOV.W	R0, @I2C_OFFSET
+		JSR	@EP24FC512_READ_PAGE
+
+		MOV.W	#H'000F, R0
+		JSR	@LCD_OFFSET
+		MOV.W	@I2C_PAGE, R0
+		MOV.B	R0H, R0L
+		JSR	@LCD_HEXDATA
+		MOV.W	@I2C_PAGE, R0
+		JSR	@LCD_HEXDATA
+
+		MOV.W	#MEMORY_PAGE1, R1
+		MOV.W	#H'0100, R0
+		JSR	@LCD_OFFSET
+		MOV.B	#10, R0H
+EEPROM_DISP_PAGE_L1:
+		MOV.B	@R1, R0L
+		JSR	@LCD_HEXDATA
+		INC.W	#1, R1
+		DEC.B	R0H
+		BNE	EEPROM_DISP_PAGE_L1
+
+		MOV.W	#H'0200, R0
+		JSR	@LCD_OFFSET
+		MOV.B	#10, R0H
+EEPROM_DISP_PAGE_L2:
+		MOV.B	@R1, R0L
+		JSR	@LCD_HEXDATA
+		INC.W	#1, R1
+		DEC.B	R0H
+		BNE	EEPROM_DISP_PAGE_L2
+
+		MOV.W	#H'0300, R0
+		JSR	@LCD_OFFSET
+		MOV.B	#10, R0H
+EEPROM_DISP_PAGE_L3:
+		MOV.B	@R1, R0L
+		JSR	@LCD_HEXDATA
+		INC.W	#1, R1
+		DEC.B	R0H
+		BNE	EEPROM_DISP_PAGE_L3
+
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	EEPROMへアドレス設定	IN/ @I2C_OFFSET
+;			OUT/ Z-FLAG:1=ERR, O=OK
+;------------------------------------------------
+EEPROM_SET_ADDRESS:
+		PUSH.W	R0
+		PUSH.W	R1
+		MOV.B	#B'10100000, R0L	; 24FC512 CONTROL BYTE / SLAVE ADDRESS + W
+		JSR	@I2C_WRITE_DATA
+;		BNE	EEPROM_SET_ADDRESS_ERR
+		BCS	EEPROM_SET_ADDRESS_ERR
+		MOV.W	@I2C_PAGE, R0
+		SHLL.W	R0
+		SHLL.W	R0
+		SHLL.W	R0
+		SHLL.W	R0
+		SHLL.W	R0
+		SHLL.W	R0
+		SHLL.W	R0
+		MOV.B	R0H, R0L		; 24FC512 ADDRESS HIGH
+		JSR	@I2C_WRITE_DATA
+;		BNE	EEPROM_SET_ADDRESS_ERR
+		BCS	EEPROM_SET_ADDRESS_ERR
+
+		MOV.W	@I2C_PAGE, R0
+		MOV.B	R0L, R0H		; same as 8bits shift.
+		MOV.W	@I2C_OFFSET, R1
+		SHLL.W	R1
+		MOV.B	R1L,R0L
+		SHAR.W	R0			; 24FC512 ADDRESS LOW
+		JSR	@I2C_WRITE_DATA
+EEPROM_SET_ADDRESS_ERR:
+		POP.W	R1
+		POP.W	R0
+		BTST	#ACKBR, R0L		; 1:ACKBR
+		RTS
+
+;------------------------------------------------
+;	I2Cに記録されているページで、指定モードのの最初のページブロックを探す
+;	IN  R0L: モード番号記録種別（0:空, FF:続き, 1:パワーコマンダー,2:加速度センサー, 3:ラップ, 4:マルチ）
+;	    R1 : 検索開始のページ番号（このページから検索)
+;	OUT R0 : 見つけたページ番号（ない場合はFFFF）
+;------------------------------------------------
+EEPROM_FIND_PAGE:
+		PUSH.L	ER1
+		PUSH.W	R2
+		PUSH.W	R3
+		MOV.W	R0,R3			; R2L=R0L サブルーチン呼び出しのため、保存
+		MOV.W	R1,E1			; I2C PAGE/for loop ID
+EEPROM_FIND_PAGE_L1:
+		MOV.W	E1,R0			; I2C PAGE NO
+		MOV.W	#HEADER_BUFF, R1	; R1 MEMORY BOLOCK
+		MOV.W	#HEADER_SIZE, R2	; R2 SIZE
+		JSR	@EEPROM_READ_PAGE_WM	; 
+		MOV.W	#HEADER_BUFF, R1
+		MOV.B	@R1, R0L		; PAGE ID
+		CMP.B	R3L, R0L		; 同じ？
+		BEQ	EEPROM_FIND_PAGE_L2
+		INC.W	#1, E1
+		CMP.W	#512, E1
+		BNE	EEPROM_FIND_PAGE_L1
+		MOV.W	#H'FFFF, E1		; NOT FOUND
+EEPROM_FIND_PAGE_L2:
+		MOV.W	E1, R0
+		POP.W	R3
+		POP.W	R2
+		POP.L	ER1
+		RTS
+
+;------------------------------------------------
+;	EEPROMメモリの情報収集
+;	OUT	:
+;------------------------------------------------
+EEPROM_MEM_INFO:
+		PUSH.W	R0
+		PUSH.L	ER1
+		PUSH.W	R2
+		PUSH.W	R3
+
+		MOV.W	#0, R0
+		MOV.W	R0, @MODE1_PAGE_COUNT
+		MOV.W	R0, @MODE2_PAGE_COUNT
+		MOV.W	R0, @MODE3_PAGE_COUNT
+		MOV.W	R0, @MODE4_PAGE_COUNT
+		MOV.W	R0, @NULL_PAGE_COUNT
+
+		MOV.W	#0,E1			; I2C PAGE/for loop ID
+EEPROM_MEM_INFO_L1:
+		MOV.W	E1,R0			; I2C PAGE NO
+		MOV.W	#HEADER_BUFF, R1	; R1 MEMORY PAGE
+		MOV.W	#HEADER_SIZE, R2	; R2 SIZE
+		JSR	@EEPROM_READ_PAGE_WM
+		MOV.W	#HEADER_BUFF, R1
+
+		MOV.B	@R1, R0L
+		BNE	EEPROM_MEM_INFO_MODE1
+		MOV.W	@NULL_PAGE_COUNT, R0
+		INC.W	#1, R0
+		MOV.W	R0, @NULL_PAGE_COUNT
+		JMP	@EEPROM_MEM_INFO_OTHER
+EEPROM_MEM_INFO_MODE1:
+		CMP.B	#MENU_PCII_MON, R0L
+		BNE	EEPROM_MEM_INFO_MODE2
+		MOV.W	@MODE1_PAGE_COUNT, R0
+		INC.W	#1, R0
+		MOV.W	R0, @MODE1_PAGE_COUNT
+		JMP	@EEPROM_MEM_INFO_OTHER
+EEPROM_MEM_INFO_MODE2:
+		CMP.B	#MENU_G_MON, R0L
+		BNE	EEPROM_MEM_INFO_MODE3
+		MOV.W	@MODE2_PAGE_COUNT, R0
+		INC.W	#1, R0
+		MOV.W	R0, @MODE2_PAGE_COUNT
+		JMP	@EEPROM_MEM_INFO_OTHER
+EEPROM_MEM_INFO_MODE3:
+		CMP.B	#MENU_LAP_MON, R0L
+		BNE	EEPROM_MEM_INFO_MODE4
+		MOV.W	@MODE3_PAGE_COUNT, R0
+		INC.W	#1, R0
+		MOV.W	R0, @MODE3_PAGE_COUNT
+		JMP	@EEPROM_MEM_INFO_OTHER
+EEPROM_MEM_INFO_MODE4:
+		CMP.B	#MENU_MULTI, R0L
+		BNE	EEPROM_MEM_INFO_MODE5
+		MOV.W	@MODE4_PAGE_COUNT, R0
+		INC.W	#1, R0
+		MOV.W	R0, @MODE4_PAGE_COUNT
+;;;		JMP	@EEPROM_MEM_INFO_OTHER
+EEPROM_MEM_INFO_MODE5:
+EEPROM_MEM_INFO_OTHER:
+		INC.W	#1, E1
+		CMP.W	#512, E1
+		BNE	EEPROM_MEM_INFO_L1
+
+		POP.W	R3
+		POP.W	R2
+		POP.L	ER1
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	I2Cに記録されているページを消去
+;	IN  R0: ページ番号
+;	OUT なし
+;	指定されたページの記録種別が（0:空, FF:続き）では何もしない。
+;------------------------------------------------
+EEPROM_ERASE_PAGE:
+		PUSH.L	ER1
+		PUSH.W	R2
+		PUSH.W	R3			; FOR NEXT PAGE 
+		MOV.W	R0, E1			; 現在のページ番号
+
+		MOV.W	#HEADER_BUFF, R1	; R1 MEMORY BOLOCK
+		MOV.W	#HEADER_SIZE, R2	; R2 SIZE
+		JSR	@EEPROM_READ_PAGE_WM
+		MOV.W	#HEADER_BUFF, R1
+		MOV.B	@R1, R0L		; 記録種別
+		BEQ	EEPROM_ERASE_PAGE_E	; 0なので違う
+		CMP.B	#H'FF, R0L
+		BEQ	EEPROM_ERASE_PAGE_E	; FFなので違う（一番はじめ）
+EEPROM_ERASE_PAGE_DO:
+		PUSH.W	R0			; ページ削除処理
+		PUSH.W	R1
+		MOV.W	#HEADER_BUFF, R1	; R1 MEMORY BOLOCK
+		MOV.W	#0, R0
+		MOV.W	R0, @R1			; H_TYPE = 0
+		INC.W	#2, R1
+		MOV.W	#H'FFFF, R0
+		MOV.W	R0, @R1			; PREV_PAGE = FFFF
+		INC.W	#2, R1
+		MOV.W	@R1, R3			; HOLD CONT PAGE ID
+		MOV.W	R0, @R1			; CONT_PAGE = FFFF
+		MOV.W	E1, R0			; 書き込みページ番号
+		MOV.W	#HEADER_BUFF, R1	; R1 MEMORY BOLOCK
+		MOV.W	#HEADER_SIZE, R2	; R2 SIZE
+		JSR	@EEPROM_WRITE_PAGE_WM
+		POP.W	R1
+		POP.W	R0
+
+		CMP.W	#H'FFFF, R3
+		BEQ	EEPROM_ERASE_PAGE_E
+		MOV.W	R3, R0
+		MOV.W	R3, E1
+		MOV.W	#HEADER_BUFF, R1	; R1 MEMORY BOLOCK
+		MOV.W	#HEADER_SIZE, R2	; R2 SIZE
+		JSR	@EEPROM_READ_PAGE_WM
+		MOV.W	#HEADER_BUFF, R1
+		MOV.B	@R1, R0L		; 記録種別
+		CMP.B	#H'FF, R0L
+		BEQ	EEPROM_ERASE_PAGE_DO	; FF以外は違う
+EEPROM_ERASE_PAGE_E:
+		POP.W	R3
+		POP.W	R2
+		POP.L	ER1
+		RTS
+
+;------------------------------------------------
+;	EEPROMの全ページをフォーマット
+;------------------------------------------------
+EEPROM_FORMAT:
+		PUSH.W	R0
+		PUSH.W	R1
+		PUSH.W	R2
+		PUSH.W	R3
+
+		MOV.B	#0, R0L
+		JSR	@GET_MEMORY_PAGE_ADDRESS
+		MOV.W	R0, @CURRENT_MEM_PAGE_AD
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		MOV.W	#H'0, R0
+		MOV.W	R0, @R2			; H_TYPE = 0
+
+		MOV.W	#H'FFFF, R0
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		ADD.W	#H_PREV_PAGE, R2
+		MOV.W	R0, @R2			; PREV_PAGE = FFFF
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		ADD.W	#H_CONT_PAGE, R2
+		MOV.W	R0, @R2			; CONT_PAGE = FFFF
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		ADD.W	#H_RESERVE2, R2
+		MOV.W	#H'AA55, R0
+		MOV.W	R0, @R2			; CONT_PAGE = FFFF
+
+		MOV.W	#0, R3			; 現在のページ番号
+
+EEPROM_FORMAT_L1:
+		PUSH.W	R0
+		MOV.W	#H'0408, R0
+		JSR	@LCD_TEXT_OFFSET
+		POP.W	R0
+		PUSH.W	R0
+		JSR	@LCD_DEC_W
+		POP.W	R0
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		MOV.W	R3, R0
+		MOV.B	#0, R0H
+		MOV.W	R0, @R2			; PREV_PAGE = CURRENT ... SAMPLE
+		MOV.W	R3, R0
+		MOV.B	#H'0, R1H		; BLOCK:0
+		MOV.B	#HEADER_SIZE, R1L
+		JSR	@EEPROM_WRITE_PAGE
+
+		INC.W	#1, R3
+		CMP.W	#512, R3
+		BNE	EEPROM_FORMAT_L1
+
+		MOV.B	#0, R0L
+		JSR	@CREATE_NULLPAGE_LIST
+
+		POP.W	R3
+		POP.W	R2
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	EEPROMの空きページをPLIST_SIZE分リスト。
+;	OUT 	なし
+;------------------------------------------------
+CREATE_NULLPAGE_LIST:
+		PUSH.L	ER0
+		PUSH.L	ER1
+		PUSH.W	R2
+		PUSH.W	R3
+		PUSH.W	R4
+
+		MOV.W	@CURRENT_IIC_PAGE, E0	; CURRENT PAGE
+		MOV.W	#PLIST_SIZE, R4
+		MOV.W	#EEPROM_PAGE_LIST, R3
+		MOV.W	#H'FFFF,R0
+CREATE_NULLPAGE_LIST_INIT:
+		MOV.W	R0,@R3
+		INC.W	#2, R3
+		DEC.W	#1, R4
+		BNE	CREATE_NULLPAGE_LIST_INIT
+
+		MOV.W	#PLIST_SIZE,R4
+		MOV.W	#EEPROM_PAGE_LIST, R3
+		MOV.W	#0,E1				; I2C PAGE/for loop ID
+CREATE_NULLPAGE_LIST_L1:
+		CMP.W	E0, E1
+		BEQ	CREATE_NULLPAGE_LIST_NEXT	; SKIP CURRENT PAGE
+		MOV.W	E1,R0				; I2C PAGE NO
+		MOV.W	#HEADER_BUFF, R1		; R1 MEMORY BOLOCK
+		MOV.W	#HEADER_SIZE, R2		; R2 SIZE
+		JSR	@EEPROM_READ_PAGE_WM
+		MOV.W	#HEADER_BUFF, R1
+		MOV.B	@R1, R0L			; 記録種別
+		CMP.B	#0, R0L				; NULL PAGE
+		BNE	CREATE_NULLPAGE_LIST_NEXT
+		MOV.W	E1, @R3
+		INC.W	#2, R3
+		DEC.W	#1, R4
+		BEQ	CREATE_NULLPAGE_LIST_E
+CREATE_NULLPAGE_LIST_NEXT:
+		INC.W	#1, E1
+		CMP.W	#512, E1
+		BNE	CREATE_NULLPAGE_LIST_L1
+CREATE_NULLPAGE_LIST_E:
+		POP.W	R4
+		POP.W	R3
+		POP.W	R2
+		POP.L	ER1
+		POP.L	ER0
+		RTS
+
+;------------------------------------------------
+;	I2Cページで、空きページをリストから得る
+;	OUT R0 : 空きページ番号、FFFFは見つからない。
+;------------------------------------------------
+GET_NULLPAGE:	PUSH.W	R2
+		PUSH.W	R3
+
+		MOV.W	#PLIST_SIZE,R2
+		MOV.W	#EEPROM_PAGE_LIST, R3
+GET_NULLPAGE_L1:
+		MOV.W	@R3, R0
+		CMP.W	#H'FFFF, R0			; USED
+		BNE	GET_NULLPAGE_E
+
+		INC.W	#2, R3
+		DEC.W	#1, R2
+		BNE	GET_NULLPAGE_L1
+
+		JSR	@CREATE_NULLPAGE_LIST
+		MOV.W	#PLIST_SIZE,R2
+		MOV.W	#EEPROM_PAGE_LIST, R3
+GET_NULLPAGE_L2:
+		MOV.W	@R3, R0
+		CMP.W	#H'FFFF, R0			; USED
+		BNE	GET_NULLPAGE_E
+
+		INC.W	#2, R3
+		DEC.W	#1, R2
+		BNE	GET_NULLPAGE_L2
+GET_NULLPAGE_E:
+		POP.W	R3
+		POP.W	R2
+		RTS
+
+;------------------------------------------------
+;	空きページを使用済みに変更
+;	IN  R0 : 使用ページ番号。
+;------------------------------------------------
+SET_PAGE_USE:	PUSH.W	R1
+		PUSH.W	R2
+		PUSH.W	R3
+
+		MOV.W	#PLIST_SIZE,R2
+		MOV.W	#EEPROM_PAGE_LIST, R3
+SET_PAGE_USE_L1:
+		MOV.W	@R3, R1
+		CMP.W	R0,R1
+		BEQ	SET_PAGE_USE_L2
+		INC.W	#2, R3
+		DEC.W	#1, R2
+		BNE	SET_PAGE_USE_L1
+		JMP	@SET_PAGE_USE_E
+SET_PAGE_USE_L2:
+		MOV.W	#H'FFFF, R1
+		MOV.W	R1, @R3
+SET_PAGE_USE_E:
+		POP.W	R3
+		POP.W	R2
+		POP.W	R1
+		RTS
+
+;------------------------------------------------
+;	記録開始・終了
+;	IN R0L:MODE	= PCII_DISP_MODE@PCII / 0=NO REC
+;------------------------------------------------
+EEPROM_REC_START:
+		PUSH.W	R0
+		MOV.B	@REC_MODE, R0H
+		BEQ	EEPROM_REC_START_L1
+		JSR	@EEPROM_REC_STOP
+		JMP	@EEPROM_REC_START_E
+EEPROM_REC_START_L1:
+		MOV.B	R0L, @REC_MODE
+		JSR	@EEPROM_CREATE_FIRST_PAGE
+EEPROM_REC_START_E:
+		POP.W	R0
+		RTS
+
+EEPROM_REC_STOP:
+		PUSH.W	R0
+		MOV.B	@REC_MODE, R0L
+		BEQ	EEPROM_REC_STOP_E
+		JSR	@EEPROM_SAVE_CURRENT_PAGE
+		MOV.B	#0, R0L
+		MOV.B	R0L, @REC_MODE
+EEPROM_REC_STOP_E:
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	記録状態チェック
+;	OUT C:CCR   0=NO REC, 1=REC
+;------------------------------------------------
+EEPROM_REC_CHK:
+		PUSH.W	R0
+		ANDC	#H'FE, CCR	
+		MOV.B	@REC_MODE, R0L
+		BEQ	EEPROM_REC_CHK_E
+		ORC	#1, CCR
+EEPROM_REC_CHK_E:
+		POP.W	R0
+		RTS
+
+;================================================
+;	記録
+;================================================
+;	1) MEMORY BLOCK 確保。I2C PAGE確保
+;	2) header記録、PREV_PAGEは記録、CONT_PAGEは仮でFFFF。
+;	3) データ記録、領域が無くなるまで3)
+;	4) 記録終了時、書き込み完了
+;	5) 領域が無くなったら、次のMEMORY BLOCK 確保。I2CPAGE確保
+;	6) 2)のヘッダに、CONT_PAGEを記録。
+;	7) 1)をWRITE
+;	8) 5)のヘッダ記録。
+;	9) 4)へ
+;------------------------------------------------
+;	G monitor 1レコード登録
+;	IN @AX_X:WORD, @AX_Y:WORD, @M-SENSOR/DUMMY
+;------------------------------------------------
+SET_MEM_G_DATA:
+		PUSH.W	R0
+		PUSH.W	R1
+		PUSH.W	R2
+		MOV.B	@REC_MODE, R0L
+		CMP.B	#MENU_PCII_MON, R0L
+		BNE	SET_MEM_G_DATA_E
+		MOV.B	@SEMAPHORE, R0L
+		BNE	SET_MEM_G_DATA_ERR
+		BNOT	#0, R0L
+		MOV.B	R0L, @SEMAPHORE
+		MOV.W	@DATA_POS, R2
+
+		MOV.W	@AX_X, R0
+		MOV.W	R0, @R2
+		ADD.W	#G_Y, R2
+		MOV.W	@AX_Y, R0
+		MOV.W	R0, @R2
+		MOV.W	@DATA_POS, R2
+		ADD.W	#G_MAG_ID, R2
+		MOV.B	R1L, @R2
+		MOV.W	@DATA_POS, R2
+		ADD.W	#G_RESERVE, R2
+		MOV.B	#0, R0L
+		MOV.B	R0L, @R2
+		MOV.W	@DATA_POS, R2
+		ADD.W	#G_1RECORD_SIZE, R2
+		MOV.W	R2, @DATA_POS
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R1
+		ADD.W	#EEPROM_PAGE_SIZE, R1
+		CMP.W	R1, R2
+		BNE	SET_MEM_G_DATA_SEMAPHORE
+
+		JSR	@EEPROM_SAVE_AND_CREATE_NEXT
+SET_MEM_G_DATA_SEMAPHORE:
+		MOV.B	#0, R0L
+		MOV.B	R0L, @SEMAPHORE
+		JMP	@SET_MEM_G_DATA_E
+SET_MEM_G_DATA_ERR:
+;;;;;;		JSR	@SHOW_REC_ERR
+SET_MEM_G_DATA_E:
+		POP.W	R2
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	PCII monitor 1レコード登録
+;	IN R0:ADDRESS OF [M_REV, ....]<8Bytes>
+;		W:M_REV	
+;		B:M_IGN	
+;		B:M_AIR	
+;		B:M_TPo	
+;		B:M_TP	
+;		B:M_FUEL
+;		B:M_RESERVE
+;------------------------------------------------
+SET_MEM_PCII_DATA:
+		PUSH.W	R0
+		PUSH.W	R1
+		PUSH.W	R2
+		PUSH.W	R3
+		MOV.W	R0, R1
+		MOV.B	@REC_MODE, R0L
+		CMP.B	#MENU_PCII_MON, R0L
+		BNE	SET_MEM_PCII_DATA_E
+		JSR	@EEPROM_REC_START
+		MOV.W	@DATA_POS, R2
+		MOV.B	#4, R3L
+SET_MEM_PCII_DATA_L:
+		MOV.W	@R1, R0
+		MOV.W	R0, @R2
+		INC.W	#2,R1
+		INC.W	#2,R2
+		MOV.W	R2, @DATA_POS
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R0
+		ADD.W	#EEPROM_PAGE_SIZE, R0
+		CMP.W	R0, R2
+		BNE	SET_MEM_PCII_DATA_L2
+		JSR	@EEPROM_SAVE_AND_CREATE_NEXT
+SET_MEM_PCII_DATA_L2:
+		DEC.B	R3L
+		BNE	SET_MEM_PCII_DATA_L
+SET_MEM_PCII_DATA_E:
+		POP.W	R3
+		POP.W	R2
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	LAP 1レコード登録
+;	IN R0:ADDRESS OF [LAST_SEC,LAST_MSEC, ..., LAST_SEC3]<10Bytes>
+;------------------------------------------------
+SET_MEM_LAP_DATA:
+		PUSH.W	R0
+		PUSH.W	R1
+		PUSH.W	R2
+		PUSH.W	R3
+		MOV.W	R0, R1
+		MOV.B	@REC_MODE, R0L
+		CMP.B	#MENU_LAP_MON, R0L
+		BEQ	SET_MEM_LAP_DATA_L0
+		CMP.B	#MENU_MULTI, R0L
+		BNE	SET_MEM_LAP_DATA_E
+		MOV.B	@SEMAPHORE, R0L
+		BNE	SET_MEM_LAP_DATA_ERR
+		BNOT	#0, R0L
+		MOV.B	R0L, @SEMAPHORE
+		MOV.W	@DATA_POS, R2
+
+SET_MEM_LAP_DATA_L0:
+		MOV.W	@DATA_POS, R2
+		MOV.B	#LAP_1RECORD, R3L
+		SHLR.B	R3L
+SET_MEM_LAP_DATA_L:
+		MOV.W	@R1, R0
+		MOV.W	R0, @R2
+		INC.W	#2,R1
+		INC.W	#2,R2
+		MOV.W	R2, @DATA_POS
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R0
+		ADD.W	#EEPROM_PAGE_SIZE, R0
+		CMP.W	R0, R2
+		BNE	SET_MEM_LAP_DATA_L2
+		JSR	@EEPROM_SAVE_AND_CREATE_NEXT
+SET_MEM_LAP_DATA_L2:
+		DEC.B	R3L
+		BNE	SET_MEM_LAP_DATA_L
+		MOV.B	#0, R0L
+		MOV.B	R0L, @SEMAPHORE
+		JMP	@SET_MEM_LAP_DATA_E
+SET_MEM_LAP_DATA_ERR:
+;;;;;;		JSR	@SHOW_REC_ERR
+SET_MEM_LAP_DATA_E:
+		POP.W	R3
+		POP.W	R2
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+;------------------------------------------------
+;	MULTI DATA 1レコード登録
+;	IN @AX_X:WORD, @AX_Y:WORD, @M-SENSOR/DUMMY
+;	LAPデータは、SET_MEM_LAP_DATA　と兼用
+;	G, PCIIデータは、このサブルーチンを使う
+;	共に１０バイト。先頭バイトで識別（FFのときG,PCIIデータ）
+;	先に呼ばれたSET_MEM_MULTI_PCIIで、保存したPCIIデータを使う
+;------------------------------------------------
+SET_MEM_MULTI_DATA:
+		PUSH.W	R0
+		PUSH.W	R1
+		PUSH.W	R2
+		MOV.B	@REC_MODE, R0L
+		CMP.B	#MENU_MULTI, R0L
+		BNE	SET_MEM_MULTI_DATA_E
+
+		MOV.W	@DATA_POS, R2
+		MOV.W	#H'FF00, R0			; 識別コードFF, 磁気センサーデータは常に０とする。
+		MOV.W	R0, @R2
+		INC.W	#2, R2
+		MOV.W	@AX_X, R0
+		MOV.W	R0, @R2
+		INC.W	#2, R2
+		MOV.W	@AX_Y, R0
+		MOV.W	R0, @R2
+		INC.W	#2, R2
+		MOV.W	 @MULTI_DATA_REV, R0
+		MOV.W	R0, @R2
+		INC.W	#2, R2
+		MOV.B	 @MULTI_DATA_TP, R0L
+		MOV.B	R0L, @R2
+		INC.W	#2, R2
+		MOV.W	R2, @DATA_POS
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R1
+		ADD.W	#EEPROM_PAGE_SIZE, R1
+		CMP.W	R1, R2
+		BNE	SET_MEM_MULTI_DATA_E
+		JSR	@EEPROM_SAVE_AND_CREATE_NEXT
+
+SET_MEM_MULTI_DATA_E:
+		POP.W	R2
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+SET_MEM_MULTI_PCII:
+		MOV.W	R0, @MULTI_DATA_REV
+		MOV.B	R1L,@MULTI_DATA_TP
+		RTS
+
+;================================================
+;	MEMORY PAGE 処理
+;================================================
+;------------------------------------------------
+;	作業用ページのアドレス取得
+;	IN   ROL:MEMORY BLOCK番号(0/1)
+;	OUT  R0: MEMORY BLOCKアドレス
+;------------------------------------------------
+GET_MEMORY_PAGE_ADDRESS:
+		PUSH.W	R1
+		MOV.W	#MEMORY_PAGE1, R1
+		CMP.B	#0,R0L
+		BEQ	GET_MEMORY_PAGE_ADDRESS_L1
+		MOV.W	#MEMORY_PAGE2, R1
+GET_MEMORY_PAGE_ADDRESS_L1:
+		MOV.W	R1, R0
+		POP.W	R1
+		RTS
+
+;------------------------------------------------
+;	PAGE指定読み込み
+;	IN	RO:EEPROM PAGE NO
+;	OUT	R0L: HEADER ID
+;------------------------------------------------
+LOAD_PAGE_FROM_EEPROM:
+		PUSH.W	R1
+		MOV.W	R0,R1
+		AND.W	#H'FE00,R1
+		BEQ	LOAD_PAGE_FROM_EEPROM_L1
+		MOV.B	#0, R0L
+		JMP	@LOAD_PAGE_FROM_EEPROM_E
+LOAD_PAGE_FROM_EEPROM_L1:
+		MOV.B	#H'0, R1H			; R1H MEMORY BOLOCK
+		MOV.B	R1H, @CURRENT_MEM_PAGE
+		MOV.B	#EEPROM_PAGE_SIZE, R1L		; R1L SIZE
+		JSR	@EEPROM_READ_PAGE		; RETURN R0:MEMORY ADDRESS
+		MOV.W	R0, @CURRENT_MEM_PAGE_AD
+		MOV.W	R0, R1
+		ADD.W	#HEADER_SIZE, R0
+		MOV.W	R0, @DATA_POS			; ADDRESS
+
+		MOV.B	@R1, R0L			; HEADER ID
+LOAD_PAGE_FROM_EEPROM_E:
+		POP.W	R1
+		RTS
+
+;------------------------------------------------
+;	次のPAGE 読み込み
+;	OUT	R0L : FF = PAGE なし
+;------------------------------------------------
+LOAD_NEXTPAGE_FROM_EEPROM:
+		PUSH.W	R1
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R1
+		ADD.W	#H_CONT_PAGE, R1
+		MOV.W	@R1, R0			; NEXT I2C PAGE
+		CMP.W	#H'FFFF, R0
+		BEQ	LOAD_NEXTPAGE_FROM_EEPROM_E
+		MOV.B	#H'0, R1H		; R1H MEMORY BOLOCK
+		MOV.B	R1H, @CURRENT_MEM_PAGE
+		MOV.B	#EEPROM_PAGE_SIZE, R1L	; R1L SIZE
+		JSR	@EEPROM_READ_PAGE		; RETURN R0:MEMORY ADDRESS
+		MOV.W	R0, @CURRENT_MEM_PAGE_AD
+		ADD.W	#HEADER_SIZE, R0
+		MOV.W	R0, @DATA_POS		; ADDRESS
+		MOV.B	#0, R0L
+LOAD_NEXTPAGE_FROM_EEPROM_E:
+		POP.W	R1
+		RTS
+
+;------------------------------------------------
+;	指定バイト読み込み
+;	IN	R1:読み込みアドレス
+;		R0L:読み込みバイト数
+;	OUT	R0L:読み込みバイト数
+;------------------------------------------------
+GET_DATA_FROM_MEMORY:
+		PUSH.W	R1
+		PUSH.W	R2
+		PUSH.W	R3
+		PUSH.W	R4
+
+		MOV.W	R1, R2			; DST ADDRESS
+		MOV.W	@DATA_POS, R3		; SRC ADDRESS
+		MOV.B	#0, R4H			; RESULT SIZE
+		MOV.B	R0L, R4L		; READ SIZE
+		BEQ	GET_DATA_FROM_MEMORY_E
+
+GET_DATA_FROM_MEMORY_L1:
+		MOV.W	@CURRENT_MEM_PAGE_AD, R1
+		ADD.W	#EEPROM_PAGE_SIZE, R1	; END OF BUFFER
+		CMP.W	R1, R3
+		BNE	GET_DATA_FROM_MEMORY_1BYTE
+		JSR	@LOAD_NEXTPAGE_FROM_EEPROM
+		CMP.B	#H'FF, R0L
+		BEQ	GET_DATA_FROM_MEMORY_E
+		MOV.W	@DATA_POS, R3		; SRC ADDRESS
+		MOV.W	@CURRENT_MEM_PAGE_AD, R1
+		ADD.W	#EEPROM_PAGE_SIZE, R1	; END OF BUFFER
+GET_DATA_FROM_MEMORY_1BYTE:
+		MOV.B	@R3, R0L
+		MOV.B	R0L, @R2
+		INC.W	#1, R2
+		INC.W	#1, R3
+		INC.B	R4H
+		DEC.B	R4L
+		BNE	GET_DATA_FROM_MEMORY_L1
+
+GET_DATA_FROM_MEMORY_E:
+		MOV.W	R3,@DATA_POS		; SRC ADDRESS
+		MOV.B	R4H, R0L
+		POP.W	R4
+		POP.W	R3
+		POP.W	R2
+		POP.W	R1
+		RTS
+
+;------------------------------------------------
+;	FIRST BLOCK作成
+;	OUT R0L:I2C PAGE ID,  (FFFF:エラー)
+;	    FFFFの場合、メモリ確保できていないので、呼び出し元はエラー処理すること
+;------------------------------------------------
+EEPROM_CREATE_FIRST_PAGE:
+		PUSH.W	R1
+		PUSH.L	ER2
+
+		JSR	@GET_NULLPAGE
+		MOV.W	R0, @CURRENT_IIC_PAGE
+		CMP.W	#H'FFFF, R0
+		BEQ	EEPROM_CREATE_FIRST_PAGE_ERR		; 空き領域なし
+		MOV.B	#0, R0L
+		MOV.B	R0L, @CURRENT_MEM_PAGE
+		JSR	@GET_MEMORY_PAGE_ADDRESS
+		MOV.W	R0, @CURRENT_MEM_PAGE_AD
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+
+		MOV.B	#0, R0L
+		MOV.B	R0L,@PAGE_NUM
+		MOV.B	@REC_MODE, R0H
+		MOV.W	R0, @R2				; ID, PAGE_NUM
+
+		MOV.W	#H'FFFF, R0
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		ADD.W	#H_PREV_PAGE, R2
+		MOV.W	R0, @R2				; PREV_PAGE = FFFF
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		ADD.W	#H_CONT_PAGE, R2
+		MOV.W	R0, @R2				; CONT_PAGE = FFFF
+
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		ADD.W	#HEADER_SIZE, R2
+		MOV.W	R2, @DATA_POS
+;;;;;;		JSR	@SHOW_REC_PAGE
+		JMP	@EEPROM_CREATE_FIRST_PAGE_E
+EEPROM_CREATE_FIRST_PAGE_ERR:
+		MOV.W	#H'8000, R0			; 未使用領域
+		MOV.W	R0, @CURRENT_MEM_PAGE_AD	; FAIL SAFE 処理
+		MOV.W	R0, @DATA_POS			; FAIL SAFE 処理
+EEPROM_CREATE_FIRST_PAGE_E:
+		MOV.W	@CURRENT_IIC_PAGE, R0
+		POP.L	ER2
+		POP.W	R1
+		RTS
+
+;------------------------------------------------
+;	NEXT BLOCK作成 & CURRENT BLOCK書き込み
+;	OUT R0L:I2C PAGE ID,  (FFFF:エラー)
+;	    FFFFの場合、メモリ確保できていないので、呼び出し元はエラー処理すること
+;------------------------------------------------
+EEPROM_SAVE_AND_CREATE_NEXT:
+		PUSH.W	R1
+		PUSH.L	ER2
+;　新しいページ生成
+		MOV.W	@CURRENT_IIC_PAGE, R0
+		JSR	@SET_PAGE_USE
+		JSR	@GET_NULLPAGE
+		MOV.W	R0, @NEXT_IIC_PAGE
+		CMP.W	#H'FFFF, R0
+		BNE	EEPROM_SAVE_AND_CREATE_NEXT_L1
+		JMP	@EEPROM_SAVE_AND_CREATE_NEXT_ERR ; 空き領域なし、最後のページ
+
+EEPROM_SAVE_AND_CREATE_NEXT_L1:
+		MOV.B	@CURRENT_MEM_PAGE, R0L
+		BNOT	#0, R0L
+		MOV.B	R0L, @NEXT_MEM_PAGE		; 次のメモリブロック
+		JSR	@GET_MEMORY_PAGE_ADDRESS
+		MOV.W	R0, @NEXT_MEM_PAGE_AD
+
+		MOV.W	@NEXT_MEM_PAGE_AD, R2
+		MOV.B	#H'FF, R0H
+		MOV.B	@PAGE_NUM, R0L
+		INC.B	R0L
+		MOV.B	R0L, @PAGE_NUM
+		MOV.W	R0, @R2					; ID, PAGE_NUM
+		ADD.W	#H_PREV_PAGE, R2
+		MOV.W	@CURRENT_IIC_PAGE, R0
+		MOV.W	R0, @R2					; PREV_PAGE = CURRENT
+		MOV.W	@NEXT_MEM_PAGE_AD, R2
+		ADD.W	#H_CONT_PAGE, R2
+		MOV.W	#H'FFFF, R0
+		MOV.W	R0, @R2					; CONT_PAGE = FFFF
+
+		MOV.W	@NEXT_MEM_PAGE_AD, R2
+		ADD.W	#HEADER_SIZE, R2
+		MOV.W	R2, @DATA_POS
+
+; 現在のページのLINK埋め込みと書き込み
+		MOV.W	@CURRENT_MEM_PAGE_AD, R2
+		ADD.W	#H_CONT_PAGE, R2
+		MOV.W	@NEXT_IIC_PAGE, R0
+		MOV.W	R0, @R2					; CONT_PAGE =次のI2C PAGE
+		MOV.W	@CURRENT_IIC_PAGE, R0			; RO:I2C PAGE番号
+		MOV.B	@CURRENT_MEM_PAGE, R1H			; R1H:書き込みたいMEMORY BLOCK番号(0/1)
+		MOV.B	#EEPROM_PAGE_SIZE, R1L		; R1L:書き込み込みバイト数4バイト以上
+		JSR	@EEPROM_WRITE_PAGE			; R0:I2C_PAGE, R1H:MEM BLOCK, R1L:SIZE
+
+		MOV.W	@NEXT_IIC_PAGE, R0
+		MOV.W	R0, @CURRENT_IIC_PAGE
+		MOV.W	@NEXT_MEM_PAGE_AD, R0
+		MOV.W	R0, @CURRENT_MEM_PAGE_AD
+		MOV.B	@NEXT_MEM_PAGE, R0L
+		MOV.B	R0L, @CURRENT_MEM_PAGE
+		JMP	@EEPROM_SAVE_AND_CREATE_NEXT_E
+
+EEPROM_SAVE_AND_CREATE_NEXT_ERR:
+		JSR	@EEPROM_REC_STOP
+;;;;;;		JSR	@SHOW_REC_ERR
+		MOV.W	#H'FFFF, R0
+		MOV.W	R0, @CURRENT_IIC_PAGE
+
+EEPROM_SAVE_AND_CREATE_NEXT_E:
+		POP.L	ER2
+		POP.W	R1
+		MOV.W	@CURRENT_IIC_PAGE, R0
+		RTS
+
+;------------------------------------------------
+;	CURRENT BLOCK書き込み
+;------------------------------------------------
+EEPROM_SAVE_CURRENT_PAGE:
+		PUSH.W	R0
+		PUSH.W	R1
+		PUSH.W	R2
+		MOV.W	@CURRENT_IIC_PAGE, R0
+		JSR	@SET_PAGE_USE
+
+		MOV.W	@DATA_POS, R2
+		MOV.W	#H'FFFF,R0
+		MOV.W	@CURRENT_MEM_PAGE_AD, R1
+		ADD.W	#EEPROM_PAGE_SIZE, R1
+		CMP.W	R1, R2
+		BEQ	EEPROM_SAVE_CURRENT_PAGE_W
+EEPROM_SAVE_CURRENT_PAGE_FILL:
+		MOV.W	R0, @R2
+		INC.W	#2, R2
+		CMP.W	R1, R2
+		BNE	EEPROM_SAVE_CURRENT_PAGE_FILL
+
+EEPROM_SAVE_CURRENT_PAGE_W:
+		MOV.W	@CURRENT_IIC_PAGE, R0
+		MOV.B	@CURRENT_MEM_PAGE, R1H
+		MOV.B	#EEPROM_PAGE_SIZE, R1L
+		JSR	@EEPROM_WRITE_PAGE			; R0:I2C_PAGE, R1H:MEM BLOCK, R1L:SIZE
+;;;;;;		JSR	@SHOW_REC_END
+
+		POP.W	R2
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+;=================================================
+	.SECTION PDATA, DATA, ALIGN=2
+		.ALIGN	2
+
+I2C_PAGE		.RES.W	1
+I2C_OFFSET		.RES.W	1
+RW_LENGTH		.RES.W	1
+MEMORY_ADDRESS		.RES.W	1
+
+MEMORY_PAGE1		.RES.B	EEPROM_PAGE_SIZE
+MEMORY_PAGE2		.RES.B	EEPROM_PAGE_SIZE
+
+DEBUG_PAGE_NO		.RES.W	1
+
+EEPROM_PAGE_LIST	.RES.W	PLIST_SIZE	; ページを探しておく
+HEADER_BUFF		.RES.B	HEADER_SIZE
+
+CURRENT_MEM_PAGE_AD	.RES.W	1
+CURRENT_IIC_PAGE	.RES.W	1
+CURRENT_MEM_PAGE	.RES.B	1
+
+NEXT_MEM_PAGE		.RES.B	1
+			.ALIGN	2
+NEXT_MEM_PAGE_AD	.RES.W	1
+NEXT_IIC_PAGE		.RES.W	1
+			.ALIGN	2
+
+DATA_POS		.RES.W	1
+REC_MODE		.RES.B	1		; SAME AS DISP_MODE@PCII, BUT 0 IF NO RECORD
+SEMAPHORE		.RES.B	1
+PAGE_NUM		.RES.B	1
+
+MULTI_DATA_TP		.RES.B	1
+			.ALIGN	2
+MULTI_DATA_REV		.RES.W	1
+
+MODE1_PAGE_COUNT	.RES.W	1
+MODE2_PAGE_COUNT	.RES.W	1
+MODE3_PAGE_COUNT	.RES.W	1
+MODE4_PAGE_COUNT	.RES.W	1
+NULL_PAGE_COUNT		.RES.W	1
+
+	.END

@@ -1,0 +1,746 @@
+;===== PCII_DATA.ASM ========================================
+;, コマンド処理		（SCI3のRXバッファデータ解析)
+;				toya@v007.vaio.ne.jp
+;	CPU H8/3664
+;
+;-------------------------------------------------
+;
+;	コマンドに対する、PCIIからのデータ
+;		CMD 52 -> Length 14: FF 80 02 C0 D4 80 80 80 80 FF 54 3F 66 33 	
+;		CMD 44 -> Length 11: C0 D4 80 80 80 80 FF 55 48 68 33 	
+;		CMD 00 -> Length 288: 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 
+;		CMD 01 -> Length 288: 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 
+;		CMD 02 -> Length 288: 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 
+;		CMD 03 -> Length 288: 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 80 
+;	PCIIからのデータを以下のように仮定
+;		FF <80> **: ** バージョン
+;		FF 11<~80> 22 33 44 : データ 11 22 33 44
+;		CD D4 11 22 33 44 : 回転数
+;
+;		CMD 44 -> Length 11: A1 A2 A3 A4 A5 A6 B1 B2 B3 B4 B5
+;				     A1,A2 : 多分回転数
+;				     A3    : IGN ADV:80H基準  7Bh-85h(0), 1h(-11), 
+;							      41h(-6), 42h(-5)
+;							      7Ah(-1), 86h(+1)
+;							      F7h(10), F8h(11), FEh(11)
+;				     A4    : MP  CHG 80H基準、1:1
+;				     A5    : AAP CHG 80H基準  1h(-50) .. FEh(+49)
+;				     A6    : TP out  80H基準、1h(-40) .. FEh(+40) TPに加算
+;				     B1    : 固定(ff)
+;				     B2    : 不明
+;				     B3    : 固定(b3)
+;				     B4    : TP（スロットルポジション）　3Ah(0)基準
+;						1h(-36) .. FEh(124) :100:D8h
+;				     B5    : 固定(33)
+
+	.FORM	COL=120
+	.PRINT	LIST		;アセンブル時にリストファイルを出力する
+	.CPU 300HN		;ＣＰＵの指定
+
+	.IMPORT		GET_CHAR
+	.IMPORT		LCD_CHAR
+	.IMPORT		LCD_OFFSET
+	.IMPORT		LCD_TEXT_OFFSET
+	.IMPORT		LCD_STRING
+	.IMPORT		LCD_HEXDATA
+	.IMPORT		LCD_DEC_B_S
+	.IMPORT		LCD_DEC_W
+	.IMPORT		LCD_DEC_B
+
+	.IMPORT		LCD_PCII_DATA_CS1
+
+	.IMPORT		SET_MEM_PCII_DATA
+	.IMPORT		SET_MEM_MULTI_PCII
+
+	.EXPORT		PCII_DATA_INIT
+	.EXPORT		PCII_DATA_OFFSET
+	.EXPORT		SET_READ_MODE
+	.EXPORT		MON_PCII_INIT		; for debug but char LCD
+	.EXPORT		MON_PCII		; for debug but char LCD
+	.EXPORT		GET_PCII_SIM
+	.EXPORT		GET_PCII
+
+	.EXPORT		DATA_CONDITION1
+	.EXPORT		DATA_CONDITION2
+
+	.EXPORT		M_REV
+	.EXPORT		M_TP
+	.EXPORT		M_AAP
+	.EXPORT		M_TPo
+	.EXPORT		M_MP
+
+TP_MAX_POS	.EQU	H'D8
+RXD_BUFF_SIZE	.EQU	320
+
+;=================================================
+	.SECTION ROM, CODE, ALIGN=2
+;-------------------------------------------------
+;	初期化処理
+;	IN	R0L:INIT CMD_TYPE
+;-------------------------------------------------
+PCII_DATA_INIT:	PUSH.L	ER0
+		MOV.B	R0L, @CMD_TYPE
+		MOV.W	#DATA_CON_EOL, R0
+		MOV.W	R0,@DATA_STATE
+		MOV.B	#H'3A, R0L
+		MOV.B	R0L, @TP_ZERO_POS
+		MOV.B	#TP_MAX_POS, R0H
+		SUB.B	R0L, R0H
+		INC.B	R0H
+		MOV.B	R0H, @TP_BAND
+
+		MOV.W	#0, R0
+		MOV.W	R0, @S_REV
+		MOV.B	R0L, @S_TP
+		MOV.B	R0L, @S_AAP
+		MOV.B	R0L, @S_TPo
+		MOV.B	R0L, @S_MP
+		MOV.B	R0L, @S_SIM_LOOP
+
+		POP.L	ER0
+		RTS
+
+PCII_DATA_OFFSET:
+		PUSH.L	ER0
+		MOV.B	@TP_RAW, R0L
+		MOV.B	R0L, @TP_ZERO_POS
+		MOV.B	#TP_MAX_POS, R0H
+		SUB.B	R0L, R0H
+		INC.B	R0H
+		MOV.B	R0H, @TP_BAND
+		POP.L	ER0
+		RTS
+
+;-------------------------------------------------
+;	スロットル開度計算処理  :3A=0 ...D8:100
+;	IN:R0L  = スロットル直値(3A..D8)
+;	OUT:ROL = スロットル開度(0..100)
+;	BROKEN : ROH
+;-------------------------------------------------
+CALC_TH:	PUSH.W	R1
+		MOV.B	R0L, @TP_RAW
+		MOV.B	@TP_ZERO_POS, R1L
+		CMP.B	R1L, R0L
+		BCS	CALC_TH_ERR
+		CMP.B	#TP_MAX_POS, R0L
+		BCC	CALC_TH_ERR
+		SUB.B	R1L, R0L
+		MOV.B	#0, R0H
+		MOV.B	#100, R1L
+		MULXU.B	R1L, R0
+		MOV.B	@TP_BAND, R1L
+		DIVXU.B	R1L, R0
+		CMP.B	#0, R0H			; ROH=余り
+		BEQ	CALC_TH_E
+		INC.B	R0L			; 余りがあるときは、商(R0L)を+1する。
+		JMP	@CALC_TH_E
+CALC_TH_ERR:	MOV.B	#H'FF, R0L
+CALC_TH_E:	POP.W	R1
+		RTS
+
+;-------------------------------------------------
+;	比率計算処理  : 0..FFh : -40..40
+;	IN:R0L  = 入力値(0..FF)
+;	OUT:ROL = 出力値(-40..40)
+;-------------------------------------------------
+TR40:		PUSH.W	R1
+		PUSH.W	R2
+		MOV.B	R0L, R1L
+		MOV.B	#0, R1H
+		SHLL.W	R1			; *2
+		SHLL.W	R1			; *4
+		SHLL.W	R1			; *8
+		MOV.W	R1, R2
+		SHLL.W	R1			; *16
+		SHLL.W	R1			; *32
+		ADD.W	R2, R1			; R1 *40
+		SHLL.W	R1			; R1 *80
+		MOV.B	R1H, R0L
+		MOV.B	#40, R1L
+		SUB.B	R1L, R0L
+		POP.W	R2
+		POP.W	R1
+		RTS
+
+;-------------------------------------------------
+;	比率計算処理  : 0..FFh : -40..40
+;	IN:R0L  = 入力値(0..FF)
+;	OUT:ROL = 出力地(-50..50)
+;-------------------------------------------------
+TR50:		PUSH.W	R1
+		PUSH.W	R2
+		MOV.B	R0L, R1L
+		MOV.B	#0, R1H
+		SHLL.W	R1			; R1 *2
+		MOV.W	R1, R2			; R2 *2
+		SHLL.W	R1			; R1 *4
+		SHLL.W	R1			; R1 *8
+		SHLL.W	R1			; R1 *16
+		ADD.W	R1, R2			; R2 *18
+		SHLL.W	R1			; R1 *32
+		ADD.W	R2, R1			; R1 *50
+		SHLL.W	R1			; R1 *100
+		MOV.B	R1H, R0L
+		MOV.B	#50, R1L
+		SUB.B	R1L, R0L
+		POP.W	R2
+		POP.W	R1
+		RTS
+
+;-------------------------------------------------
+;	回転数計算処理
+;	OUT:R0 = REV
+;-------------------------------------------------
+CALC_REV	PUSH.W	E0
+		PUSH.L	ER1
+		PUSH.L	ER2
+
+		MOV.L	#0, ER0
+		MOV.L	#0, ER1
+		MOV.L	#0, ER2
+		MOV.B	@REV_A2, R2L
+		CMP.B	#H'75, R2L
+		BCS	CALC_REV_START
+		JMP	@CALC_REV_E
+CALC_REV_START:
+		SHAL.B	R2L
+		ADD.W	#REV_DELTA_LIST, R2
+		MOV.W	@R2, R1				; DELTA
+		MOV.L	#0, ER2
+		MOV.B	@REV_A1, R0L
+		NOT.B	R0L
+		BTST	#0, R0L
+		BEQ	CALC_REV_CHK_BIT1
+		ADD.L	ER1, ER2
+CALC_REV_CHK_BIT1:
+		SHAL.L	ER1
+		BTST	#1, R0L
+		BEQ	CALC_REV_CHK_BIT2
+		ADD.L	ER1, ER2
+CALC_REV_CHK_BIT2:
+		SHAL.L	ER1
+		BTST	#2, R0L
+		BEQ	CALC_REV_CHK_BIT3
+		ADD.L	ER1, ER2
+CALC_REV_CHK_BIT3:
+		SHAL.L	ER1
+		BTST	#3, R0L
+		BEQ	CALC_REV_CHK_BIT4
+		ADD.L	ER1, ER2
+CALC_REV_CHK_BIT4:
+		SHAL.L	ER1
+		BTST	#4, R0L
+		BEQ	CALC_REV_CHK_BIT5
+		ADD.L	ER1, ER2
+CALC_REV_CHK_BIT5:
+		SHAL.L	ER1
+		BTST	#5, R0L
+		BEQ	CALC_REV_CHK_BIT6
+		ADD.L	ER1, ER2
+CALC_REV_CHK_BIT6:
+		SHAL.L	ER1
+		BTST	#6, R0L
+		BEQ	CALC_REV_CHK_BIT7
+		ADD.L	ER1, ER2
+CALC_REV_CHK_BIT7:
+		SHAL.L	ER1
+		BTST	#7, R0L
+		BEQ	CALC_REV_BASE
+		ADD.L	ER1, ER2
+CALC_REV_BASE:
+		SHAL.L	ER2
+		SHAL.L	ER2
+		SHAL.L	ER2
+		SHAL.L	ER2
+		SHAL.L	ER2
+		SHAL.L	ER2
+		SHAL.L	ER2
+		SHAL.L	ER2
+		MOV.W	#0, R1
+		MOV.B	@REV_A2, R1L
+		SHAL.W	R1
+		ADD.W	#REV_LIST, R1
+		MOV.W	@R1, E1
+		ADD.W	E1, E2
+CALC_REV_E:
+		MOV.W	E2, R0
+		POP.L	ER2
+		POP.L	ER1
+		POP.W	E0
+		RTS
+
+REV_LIST	.DATA.W		0,29354, 19556, 14662, 11727, 9771, 8375, 7327, 6513
+		.DATA.W		5861, 5328, 4884, 4508, 4186, 3907, 3663, 3447
+		.DATA.W		3255, 3084, 2930, 2790, 2663, 2547, 2441, 2344
+		.DATA.W		2253, 2170, 2092, 2020, 1953, 1890, 1831, 1775
+		.DATA.W		1723, 1674, 1627, 1583, 1542, 1502, 1464, 1429
+		.DATA.W		1395, 1362, 1331, 1302, 1273, 1246, 1220, 1195
+		.DATA.W		1171, 1148, 1126, 1105, 1085, 1065, 1046, 1028
+		.DATA.W		1010, 993, 976, 960, 945, 930, 915, 901
+		.DATA.W		887, 874, 861, 849, 837, 825, 813, 802
+		.DATA.W		791, 781, 771, 760, 751, 741, 732, 723
+		.DATA.W		714, 705, 697, 689, 681, 673, 665, 658
+		.DATA.W		651, 643, 636, 630, 623, 616, 610, 604
+		.DATA.W		597, 591, 585, 580, 574, 568, 563, 558
+		.DATA.W		552, 547, 542, 537, 532, 527, 523, 518
+		.DATA.W		513, 509, 505, 500
+
+REV_DELTA_LIST	.DATA.W		0,29011, 9683, 4843, 2907, 1938, 1384, 1038, 807
+		.DATA.W		646, 529, 440, 373, 319, 277, 242, 214
+		.DATA.W		190, 170, 153, 139, 126, 115, 106, 97
+		.DATA.W		90, 83, 77, 72, 67, 62, 58, 55
+		.DATA.W		52, 49, 46, 44, 41, 39, 38, 35
+		.DATA.W		33, 32, 31, 29, 28, 27, 26, 25
+		.DATA.W		24, 23, 22, 21, 20, 19, 19, 18
+		.DATA.W		17, 17, 17, 16, 15, 15, 15, 14
+		.DATA.W		14, 13, 13, 12, 12, 12, 12, 11
+		.DATA.W		11, 10, 10, 10, 9, 10, 9, 9
+		.DATA.W		9, 9, 8, 8, 8, 8, 8, 7
+		.DATA.W		7, 8, 7, 6, 7, 7, 6, 6
+		.DATA.W		7, 6, 6, 5, 6, 6, 5, 5
+		.DATA.W		6, 5, 5, 5, 5, 5, 4, 5
+		.DATA.W		5, 4, 4, 5
+
+;-------------------------------------------------
+;	PCII 受信データ設定
+;	IN R0L : SEND CMD TYPE
+;-------------------------------------------------
+SET_READ_MODE:	PUSH.W	R1
+		PUSH.W	R2
+		MOV.B	@CMD_TYPE, R0H
+		CMP.B	R0H, R0L
+		BEQ	SET_READ_MODE_L		; If the cmd is NOT the same as previous, display the cmd.
+		MOV.B	R0L, @CMD_TYPE		; If it is same, avoid the collision of displaying.
+		JSR	@SHOW_TXDATA
+SET_READ_MODE_L:
+		MOV.W	#CMD_LENGTH_MAP, R1
+SET_READ_MODE_L0:
+		MOV.W	@R1, R2
+		CMP.B	#H'FF, R2L
+		BEQ	SET_READ_MODE_E
+		CMP.B	R2L, R0L
+		BEQ	SET_READ_MODE_L1
+		ADD.W	#6, R1
+		JMP	@SET_READ_MODE_L0
+SET_READ_MODE_L1:
+		INC.W	#2, R1
+		MOV.W	@R1,R0
+		MOV.W	R0,@DATA_LENGTH
+		INC.W	#2,R1
+		MOV.W	@R1,R0
+		MOV.W	R0,@DATA_STATE
+SET_READ_MODE_E:
+		POP.W	R2
+		POP.W	R1
+		RTS
+
+		; PCII_CMD = 44 のときは11Bytes(6+5)
+		; PCII_CMD = 52 のときは14Bytes(3+6+5)
+CMD_LENGTH_MAP	.DATA.W		H'44, 11, DATA_CONDITION2
+		.DATA.W		H'52, 14, DATA_CONDITION1
+		.DATA.W		H'FFFF
+
+DATA_CONDITION1	.DATA.B		H'21,H'2,H'3
+DATA_CONDITION2	.DATA.B		H'34,H'5,H'6,H'7,H'8,H'9
+DATA_CONDITION3	.DATA.B		H'4A,H'B,H'C,H'D,H'E
+DATA_CON_EOL	.DATA.B		0
+
+		.ALIGN	2
+
+;-------------------------------------------------
+;	PCII 受信データの生表示
+;-------------------------------------------------
+;	表示は、20x4。
+;		+01234567890123456789
+;		+----------+---------+
+;		|[Power Commander II]|
+;		| FF80:XX            |
+;		| FF: 11 22 33 44    |
+;		| CD: XX 11 22 33 44 |
+;		+----------+---------+
+
+MON_PCII_INIT:	PUSH.W	R0
+		MOV.W	#H'0000, R0
+		JSR	@LCD_TEXT_OFFSET
+		MOV.W	#PCII_MSG_L0, R0
+		JSR	@LCD_STRING
+		JSR	@SHOW_TXDATA
+		MOV.W	#H'0008, R0
+		JSR	@LCD_TEXT_OFFSET
+		MOV.W	#PCII_MSG_R0, R0
+		JSR	@LCD_STRING
+		JSR	@SHOW_TXDATA
+		POP.W	R0
+		RTS
+
+SHOW_TXDATA:	MOV.W	#H'0100, R0
+		JSR	@LCD_TEXT_OFFSET
+		MOV.W	#STR_TXD, R0
+		JSR	@LCD_STRING
+		MOV.B	@CMD_TYPE, R0L
+		JSR	@LCD_HEXDATA
+		RTS
+
+PCII_MSG_L0	.SDATA		"[PC-II "
+		.DATA.B		0
+PCII_MSG_R0	.SDATA		"Monitor]"
+		.DATA.B		0
+STR_TXD		.SDATA		"TXD:"
+		.DATA.B		0
+		.ALIGN	2
+
+
+MON_PCII:	PUSH.L	ER0
+		PUSH.L	ER1
+
+MON_PCII_L1:	JSR	@GET_CHAR
+		CMP.B	#0 ,R0H
+		BNE	MON_PCII_E
+
+		MOV.W	@DATA_STATE, R1
+		MOV.B	@R1, R0H
+		BEQ	MON_PCII_E
+		INC.W	#1, R1
+		MOV.W	R1, @DATA_STATE
+
+		AND.B	#H'F0, R0H
+		CMP.B	#0, R0H
+		BEQ	MON_PCII_SHOW_DATA
+		CMP.B	#H'20, R0H
+		BEQ	MON_PCII_SHOW_TYPE2
+		CMP.B	#H'30, R0H
+		BEQ	MON_PCII_SHOW_TYPE3
+		CMP.B	#H'40, R0H
+		BEQ	MON_PCII_SHOW_TYPE4
+		JMP	@MON_PCII_E
+
+MON_PCII_SHOW_DATA:
+		PUSH.W	R0
+		MOV.B	#h'2E, R0L
+		JSR	@LCD_CHAR
+		POP.W	R0
+		JSR	@LCD_HEXDATA
+		JMP	@MON_PCII_L1
+
+MON_PCII_SHOW_TYPE2:
+		PUSH.W	R0
+		MOV.W	#H'0108, R0
+		JSR	@LCD_OFFSET
+		POP.W	R0
+		JSR	@LCD_HEXDATA
+		JMP	@MON_PCII_L1
+
+MON_PCII_SHOW_TYPE3:
+		PUSH.W	R0
+		MOV.W	#H'0200, R0
+		JSR	@LCD_OFFSET
+		POP.W	R0
+		JSR	@LCD_HEXDATA
+		JMP	@MON_PCII_L1
+
+MON_PCII_SHOW_TYPE4:
+		PUSH.W	R0
+		MOV.W	#H'0300, R0
+		JSR	@LCD_OFFSET
+		POP.W	R0
+		JSR	@LCD_HEXDATA
+		JMP	@MON_PCII_L1
+
+MON_PCII_E:	POP.L	ER1
+		POP.L	ER0
+		RTS
+
+;-------------------------------------------------
+;	PCII 受信データの変換
+;-------------------------------------------------
+;		CMD 44 -> Length 11: A1 A2 A3 A4 A5 A6 B1 B2 B3 B4 B5
+;				     A1,A2 : 多分回転数
+;				     A3    : IGN ADV:80H基準  7Bh-85h(0), 1h(-11), 
+;							      41h(-6), 42h(-5)
+;							      7Ah(-1), 86h(+1)
+;							      F7h(10), F8h(11), FEh(11)
+;				     A4    : MP  CHG 80H基準、1:1
+;				     A5    : AAP CHG 80H基準  1h(-50) .. FEh(+49)
+;				     A6    : TP out  80H基準、1h(-40) .. FEh(+40) TPに加算
+;				     B1    : 固定(ff)
+;				     B2    : 不明
+;				     B3    : 固定(b3)
+;				     B4    : TP（スロットルポジション）　3Ah(0)基準
+;						1h(-36) .. FEh(124) :100:D8h
+;				     B5    : 固定(33)
+
+
+GET_PCII:	PUSH.L	ER0
+		PUSH.L	ER1
+
+GET_PCII_L1:
+		JSR	@GET_CHAR
+		CMP.B	#0 ,R0H
+		BEQ	GET_PCII_L2			; EXIST DATA
+		JMP	@GET_PCII_E
+GET_PCII_L2:
+		MOV.W	@DATA_STATE, R1
+		MOV.B	@R1, R0H
+		BNE	GET_PCII_L3			; VALID DTA
+		JMP	@GET_PCII_E
+GET_PCII_L3:
+		INC.W	#1, R1
+		MOV.W	R1, @DATA_STATE
+
+		AND.B	#H'0F, R0H			; R0H : STATE INFO(DATA_CONDITION)
+
+		CMP.B	#4, R0H
+		BEQ	GET_PCII_SET_REV_A1
+		CMP.B	#5, R0H
+		BEQ	GET_PCII_SET_REV
+		CMP.B	#6, R0H
+		BEQ	GET_PCII_SET_IGN
+		JMP	@GET_PCII_SUB1
+
+GET_PCII_SET_REV_A1:
+		MOV.B	R0L, @REV_A1
+		JMP	@GET_PCII_L1
+
+GET_PCII_SET_REV:
+		MOV.B	R0L, @REV_A2
+		CMP.B	#H'75, R0L
+		BCC	GET_PCII_SET_REV_ERR
+		JSR	@CALC_REV
+		MOV.W	R0, @M_REV
+		JMP	@GET_PCII_L1
+GET_PCII_SET_REV_ERR:
+		MOV.W	#H'0, R0			; ERROR
+		MOV.W	R0, @M_REV
+		JMP	@GET_PCII_L1
+GET_PCII_SET_IGN:
+		JMP	@GET_PCII_L1
+
+GET_PCII_SUB1:
+		CMP.B	#7, R0H
+		BEQ	GET_PCII_SET_MPd
+		CMP.B	#8, R0H
+		BEQ	GET_PCII_SET_AAPd
+		CMP.B	#9, R0H
+		BEQ	GET_PCII_SET_TPd
+		JMP	@GET_PCII_SUB2
+
+GET_PCII_SET_MPd:
+		MOV.B	#H'80, R0H
+		SUB.B	R0H, R0L
+		SHAR.B	R0L
+		MOV.B	R0L, @M_MP
+;;;		MOV.B	#1, R0H			; 小数点フラグ
+;;;		JSR	@LCD_DEC_B_S
+		JMP	@GET_PCII_L1
+
+GET_PCII_SET_AAPd:
+		JSR	@TR50
+		MOV.B	R0L, @M_AAP
+;;;		MOV.B	#0, R0H			; 小数点フラグ
+;;;		JSR	@LCD_DEC_B_S
+		JMP	@GET_PCII_L1
+
+GET_PCII_SET_TPd:
+		JSR	@TR40
+		MOV.B	R0L, @M_TPo
+;;;		MOV.B	#0, R0H			; 小数点フラグ
+;;;		MOV.W	#H'0C05, R1
+;;;		JSR	@VRAM_DEC_B_S
+		JMP	@GET_PCII_L1
+
+GET_PCII_SUB2:
+		CMP.B	#10, R0H
+		BEQ	GET_PCII_SET_B1
+		CMP.B	#11, R0H
+		BEQ	GET_PCII_SET_B2
+		CMP.B	#12, R0H
+		BEQ	GET_PCII_SET_B3
+		CMP.B	#13, R0H
+		BEQ	GET_PCII_SET_TP
+		CMP.B	#14, R0H
+		BEQ	GET_PCII_SET_B5
+
+GET_PCII_E:	POP.L	ER1
+		POP.L	ER0
+		RTS
+
+GET_PCII_SET_B1:
+		CMP.B	#H'FF, R0L
+		BEQ	GET_PCII_SET_B1_E
+		MOV.B	@M_ERRBIT, R0L
+		BSET	#0, R0L
+		MOV.B	R0L, @M_ERRBIT
+GET_PCII_SET_B1_E:
+		JMP	@GET_PCII_L1
+
+GET_PCII_SET_B2:
+		CMP.B	#H'FF, R0L
+		BEQ	GET_PCII_SET_B2_E
+		MOV.B	@M_ERRBIT, R0L
+		BSET	#1, R0L
+		MOV.B	R0L, @M_ERRBIT
+GET_PCII_SET_B2_E:
+		JMP	@GET_PCII_L1
+
+GET_PCII_SET_B3:
+		CMP.B	#H'B3, R0L
+		BEQ	GET_PCII_SET_B3_E
+		MOV.B	@M_ERRBIT, R0L
+		BSET	#2, R0L
+		MOV.B	R0L, @M_ERRBIT
+GET_PCII_SET_B3_E:
+		JMP	@GET_PCII_L1
+
+GET_PCII_SET_B5:
+		CMP.B	#H'33, R0L
+		BEQ	GET_PCII_SET_B5_E
+		MOV.B	@M_ERRBIT, R0L
+		BSET	#3, R0L
+		MOV.B	R0L, @M_ERRBIT
+GET_PCII_SET_B5_E:
+		MOV.W	#M_PCII, R0
+		JSR	@SET_MEM_PCII_DATA
+		JSR	@LCD_PCII_DATA_CS1
+		JMP	@GET_PCII_L1
+
+GET_PCII_SET_TP:
+		JSR	@CALC_TH
+		MOV.B	R0L, @M_TP
+		CMP.B	#H'FF, R0L
+		BEQ	GET_PCII_SET_TP_L1
+;;;		MOV.W	#H'0705, R1
+;;;		JSR	@VRAM_DEC_B
+		JMP	@GET_PCII_L1
+GET_PCII_SET_TP_L1:
+		MOV.B	@M_ERRBIT, R0L
+		BSET	#4, R0L				; TP変換エラー
+		MOV.B	R0L, @M_ERRBIT
+		JMP	@GET_PCII_L1
+
+
+;-------------------------------------------------
+;	PCII データテスト
+;	1回呼出しごとにデータ変更
+;-------------------------------------------------
+GET_PCII_SIM:
+		PUSH.W	R0
+		MOV.B	@S_SIM_LOOP, R0L
+		INC.B	R0L
+		MOV.B	R0L, @S_SIM_LOOP
+		CMP.B	#10, R0L
+		BNE	GET_PCII_SIM_LE
+		MOV.B	#0, R0L
+		MOV.B	R0L, @S_SIM_LOOP
+
+		MOV.W	@S_REV, R0
+		ADD.W	#100, R0
+		CMP.W	#11000, R0
+		BCS	GET_PCII_SIM_L1
+		MOV.W	#150, R0
+GET_PCII_SIM_L1:
+		MOV.W	R0, @S_REV
+		MOV.W	R0, @M_REV
+
+		MOV.B	@S_TP, R0L
+		ADD.B	#1, R0L
+		CMP.B	#100, R0L
+		BCS	GET_PCII_SIM_L2
+		MOV.B	#0, R0L
+GET_PCII_SIM_L2:
+		MOV.B	R0L, @S_TP
+		MOV.B	R0L, @M_TP
+
+		MOV.B	@S_AAP, R0L
+		ADD.B	#2, R0L
+		CMP.B	#100, R0L
+		BCS	GET_PCII_SIM_L3
+		SUB.W	#99, R0
+GET_PCII_SIM_L3:
+		MOV.B	R0L, @S_AAP
+		MOV.B	R0L, @M_AAP
+
+
+		MOV.B	@S_TPo, R0L
+		ADD.B	#3, R0L
+		CMP.B	#100, R0L
+		BCS	GET_PCII_SIM_L4
+		SUB.W	#100, R0
+GET_PCII_SIM_L4:
+		MOV.B	R0L, @S_TPo
+		MOV.B	R0L, @M_TPo
+
+		MOV.B	@S_MP, R0L
+		ADD.B	#4, R0L
+		CMP.B	#100, R0L
+		BCS	GET_PCII_SIM_L5
+		SUB.W	#99, R0
+GET_PCII_SIM_L5:
+		MOV.B	R0L, @S_MP
+		MOV.B	R0L, @M_MP
+GET_PCII_SIM_LE:
+		POP.W	R0
+		RTS
+
+;-------------------------------------------------
+;	MULTI テストデータ入力処理
+;-------------------------------------------------
+GET_MULTI_PCII_SIM:
+		PUSH.L	ER0
+
+		MOV.W	@S_REV, R0
+		ADD.W	#100, R0
+		CMP.W	#11000, R0
+		BCS	GET_MULTI_PCII_SIM_L1
+		MOV.W	#150, R0
+GET_MULTI_PCII_SIM_L1:
+		MOV.W	R0, @S_REV
+		MOV.W	R0, @M_REV
+
+		MOV.B	@S_TP, R0L
+		ADD.B	#1, R0L
+		CMP.B	#100, R0L
+		BCS	GET_MULTI_PCII_SIM_L2
+		MOV.B	#0, R0L
+GET_MULTI_PCII_SIM_L2:
+		MOV.B	R0L, @S_TP
+		MOV.B	R0L, @M_TP
+
+		POP.L	ER0
+		RTS
+
+;=================================================
+	.SECTION PDATA, DATA, ALIGN=2
+CMD_TYPE	.RES.B	1
+		.RES.B	1
+DATA_LENGTH	.RES.W	1
+DATA_STATE	.RES.W	1			; DATA_CONDITION の位置
+
+REV_A1		.RES.B	1
+REV_A2		.RES.B	1
+
+TP_RAW		.RES.B	1
+TP_ZERO_POS	.RES.B	1
+TP_BAND		.RES.B	1
+		.ALIGN	2
+;for memory
+M_PCII
+M_REV		.RES.W	1
+M_TP		.RES.B	1
+M_AAP		.RES.B	1
+M_TPo		.RES.B	1
+M_MP		.RES.B	1
+M_IGN		.RES.B	1
+M_RES		.RES.B	1
+M_ERRBIT	.RES.B	1			;
+
+		.ALIGN	2
+S_REV		.RES.W	1
+S_TP		.RES.B	1
+S_AAP		.RES.B	1
+S_TPo		.RES.B	1
+S_MP		.RES.B	1
+S_SIM_LOOP	.RES.B	1
+
+		.ALIGN	2
+
+	.END

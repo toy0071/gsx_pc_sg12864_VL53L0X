@@ -1,0 +1,13 @@
+	.EXPORT		char_SP
+	.EXPORT		char_0
+	.EXPORT		char_period
+	.EXPORT		char_ap2
+	.EXPORT		char_hyrhen
+	.EXPORT		char_0w
+	.EXPORT		char_ap1w
+	.EXPORT		char_ap2w
+	.EXPORT		char_hyrhenw
+	.EXPORT		char_Cw
+	.EXPORT		char_Lw
+	.EXPORT		char_Bw
+	.EXPORT		char_cirBEw

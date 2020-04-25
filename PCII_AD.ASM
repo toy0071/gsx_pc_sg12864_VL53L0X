@@ -1,0 +1,398 @@
+;===== PCII_AD.ASM ========================================
+;	AD変換処理
+;	スキャンモード、割り込み使用
+;
+;				toya@v007.vaio.ne.jp
+;	CPU H8/3664-3694
+;-------------------------------------------------
+;	PB4-PB5	: AN4, AN5
+
+	.FORM	COL=120
+	.PRINT	LIST		;アセンブル時にリストファイルを出力する
+	.CPU 300HN		;ＣＰＵの指定
+
+	.INCLUDE "io.inc"
+	.INCLUDE "PCII.INC"
+
+	.IMPORT		LCD_HEXDATA
+	.IMPORT		LCD_STRING
+	.IMPORT		LCD_CHAR
+	.IMPORT		LCD_OFFSET
+
+	.IMPORT		GET_DATA_FROM_MEMORY
+
+	.EXPORT		AD_PRE_INIT
+	.EXPORT		AD_INIT
+	.EXPORT		AD_INT
+	.EXPORT		GET_G_OFF_ON
+	.EXPORT		GET_G_XY
+	.EXPORT		TURN_G_OFF_ON
+	.EXPORT		AD_DISP_PLAY
+	.EXPORT		AD_ZERO
+
+	.IMPORT		SET_MEM_G_DATA
+	.IMPORT		SET_MEM_MULTI_DATA
+
+	.EXPORT		AX_X			; WORD DATA
+	.EXPORT		AX_Y			; WORD DATA
+	.EXPORT		OFFSET_AX_LOG
+	.EXPORT		OFFSET_AY_LOG
+
+R_LED	.BEQU	1,PDR1
+G_LED	.BEQU	2,PDR1
+
+;=================================================
+	.SECTION ROM, CODE, ALIGN=2
+;-------------------------------------------------
+;	初期化処理
+;-------------------------------------------------
+AD_PRE_INIT:	MOV.W	#0, R0
+		MOV.W	R0, @AX_X
+		MOV.W	R0, @AX_Y
+		MOV.B	R0L,@G_OFF_ON
+		RTS
+
+AD_INIT:
+		MOV.W	#1, R0
+		MOV.B	R0L,@G_OFF_ON
+		MOV.W	#OFFSET_AX_LOG, R1
+		MOV.W	#64, R2
+AD_INIT_L1:	MOV.W	R0, @R1
+		INC.W	#2, R1
+		DEC.W	#1, R2
+		BNE	AD_INIT_L1
+
+		MOV.B	@ADCSR, R0L		; DUMMY
+		MOV.B	#B'00010101, R0L	; SCAN=1, CKS=0, AN4-5
+		MOV.B	R0L, @ADCSR
+		MOV.B	#0, R0L			; TRGE=OFF
+		MOV.B	R0L, @ADCR
+		NOP
+		BSET	#6, @ADCSR		; ADIE 割り込み許可
+		NOP
+;;;		BSET	#5, @ADCSR		; ADST 変換開始
+;;;		NOP
+		RTS
+
+AD_ZERO:	MOV.W	@AX_X, R0
+		MOV.W	R0, @AX_XZ		; ZERO POINT
+		MOV.W	@AX_Y, R0
+		MOV.W	R0, @AX_YZ		; ZERO POINT
+		RTS
+
+GET_G_OFF_ON:	MOV.B	@G_OFF_ON, R0L
+		RTS
+
+TURN_G_OFF_ON:	MOV.B	@G_OFF_ON, R0L
+		INC.B	R0L
+		CMP.B	#8, R0L
+		BNE	TURN_G_OFF_ON_L1
+		MOV.B	#0,R0L
+TURN_G_OFF_ON_L1:
+		MOV.B	R0L, @G_OFF_ON
+		RTS
+
+;-------------------------------------------------
+;	G-XY取得。オフセット値（ゼロ設定された後の値）
+;	OUT R0H:G_Y	上位8ビットを返す
+;	    R0L:G_X	上位8ビットを返す
+;-------------------------------------------------
+GET_G_XY:	PUSH.W	R1
+		PUSH.W	R2
+		MOV.W	@AX_X, R1
+		MOV.W	@AX_XZ, R0
+		SUB.W	R0, R1
+		MOV.W	@AX_Y, R0
+		MOV.W	@AX_YZ, R2
+		SUB.W	R2, R0
+		MOV.B	R1H, R0L
+		POP.W	R2
+		POP.W	R1
+		RTS
+
+;-------------------------------------------------
+;	表示処理
+;	記録表示
+;	[G-sen]PLYXXXX-AA/BB	XXXX:I2C PAGE, AA/BB 現在/トータル
+;	1XXXX,YYYY-XXXX,YYYY
+;	 XXXX,YYYY-XXXX,YYYY
+;	 XXXX,YYYY-XXXX,YYYY
+;-------------------------------------------------
+AD_DISP_PLAY_SUB:
+		MOV.W	#I2C_RECORD, R1
+		MOV.B	@R1, R0L
+		JSR	@LCD_HEXDATA
+		INC.W	#1,R1
+		MOV.B	@R1, R0L
+		JSR	@LCD_HEXDATA
+		INC.W	#1,R1
+		MOV.B	#H'3A,R0L
+		JSR	@LCD_CHAR
+		MOV.B	@R1, R0L
+		JSR	@LCD_HEXDATA
+		INC.W	#1,R1
+		MOV.B	@R1, R0L
+		JSR	@LCD_HEXDATA
+		MOV.B	#H'2C,R0L
+		JSR	@LCD_CHAR
+		RTS
+
+;-------------------------------------------------
+;	表示処理
+;	IN	R1:IIC NO - XXXXの表示用
+;		R0H:RECORD NO.
+;		R0L:PLAY/ DEL
+;	OUT	R0L:0=OK FF=EOF
+;	[G-sen]PLYXXXX-AA/BB	XXXX:I2C PAGE, AA/BB 現在/トータル
+;	xxxx:yyyy,xxxx:yyyy,
+;	xxxx:yyyy,xxxx:yyyy,
+;	xxxx:yyyy,xxxx:yyyy,
+;-------------------------------------------------
+AD_DISP_STR_PLY	.SDATA		"PLY"
+		.DATA.B		0
+AD_DISP_STR_DEL	.SDATA		"DEL"
+		.DATA.B		0
+AD_DISP_DELETE	.SDATA		"DELETE [    ]."
+		.DATA.B		0
+		.ALIGN 2
+
+AD_DISP_PLAY:	PUSH.W	R1
+		PUSH.W	R2
+		PUSH.W	R0
+
+		MOV.W	#H'000A, R0
+		JSR	@LCD_OFFSET
+		MOV.B	R1H, R0L
+		JSR	@LCD_HEXDATA
+		MOV.B	R1L, R0L
+		JSR	@LCD_HEXDATA
+		MOV.W	#H'000A, R0
+		JSR	@LCD_OFFSET
+		MOV.B	#H'20, R0L
+		JSR	@LCD_CHAR
+		POP.W	R0
+
+		CMP.B	#0, R0L
+		BEQ	AD_DISP_PLAY_MODE_DISP
+AD_DISP_DEL_MODE_DISP:
+		MOV.W	#H'0007, R0
+		JSR	@LCD_OFFSET
+		MOV.W	#AD_DISP_STR_DEL, R0
+		JSR	@LCD_STRING
+
+		MOV.W	#H'000F, R0
+		JSR	@LCD_OFFSET
+		MOV.B	#H'2A, R0L
+		JSR	@LCD_CHAR
+		MOV.B	#H'2A, R0L
+		JSR	@LCD_CHAR
+
+		MOV.W	#H'0103, R0
+		JSR	@LCD_OFFSET
+		MOV.W	#AD_DISP_DELETE, R0
+		JSR	@LCD_STRING
+
+		MOV.W	#H'010B, R0
+		JSR	@LCD_OFFSET
+		MOV.B	R1H, R0L
+		JSR	@LCD_HEXDATA
+		MOV.B	R1L, R0L
+		JSR	@LCD_HEXDATA
+		JMP	@AD_DISP_PLAY_E
+
+AD_DISP_PLAY_MODE_DISP:
+		PUSH.W	R0
+		MOV.W	#H'0007, R0
+		JSR	@LCD_OFFSET
+		MOV.W	#AD_DISP_STR_PLY, R0
+		JSR	@LCD_STRING
+		MOV.W	#H'000F, R0
+		JSR	@LCD_OFFSET
+		POP.W	R0
+		MOV.B	R0H, R0L
+		JSR	@LCD_HEXDATA
+
+		MOV.W	#H'0100, R0
+		JSR	@LCD_OFFSET
+		MOV.W	#I2C_RECORD, R1
+		MOV.W	#G_1RECORD_SIZE, R0
+		JSR	@GET_DATA_FROM_MEMORY
+		CMP.B	#G_1RECORD_SIZE, R0L
+		BNE	AD_DISP_PLAY_E0F
+
+		JSR	@AD_DISP_PLAY_SUB
+
+		MOV.W	#I2C_RECORD, R1
+		MOV.W	#G_1RECORD_SIZE, R0
+		JSR	@GET_DATA_FROM_MEMORY
+		CMP.B	#G_1RECORD_SIZE, R0L
+		BNE	AD_DISP_PLAY_E0F
+
+		JSR	@AD_DISP_PLAY_SUB
+
+		MOV.W	#I2C_RECORD, R1
+		MOV.W	#G_1RECORD_SIZE, R0
+		JSR	@GET_DATA_FROM_MEMORY
+		CMP.B	#G_1RECORD_SIZE, R0L
+		BNE	AD_DISP_PLAY_E0F
+
+		MOV.W	#H'0200, R0
+		JSR	@LCD_OFFSET
+		JSR	@AD_DISP_PLAY_SUB
+
+		MOV.W	#I2C_RECORD, R1
+		MOV.W	#G_1RECORD_SIZE, R0
+		JSR	@GET_DATA_FROM_MEMORY
+		CMP.B	#G_1RECORD_SIZE, R0L
+		BNE	AD_DISP_PLAY_E0F
+
+		JSR	@AD_DISP_PLAY_SUB
+
+		MOV.W	#I2C_RECORD, R1
+		MOV.W	#G_1RECORD_SIZE, R0
+		JSR	@GET_DATA_FROM_MEMORY
+		CMP.B	#G_1RECORD_SIZE, R0L
+		BNE	AD_DISP_PLAY_E0F
+
+		MOV.W	#H'0300, R0
+		JSR	@LCD_OFFSET
+		JSR	@AD_DISP_PLAY_SUB
+
+		MOV.W	#I2C_RECORD, R1
+		MOV.W	#G_1RECORD_SIZE, R0
+		JSR	@GET_DATA_FROM_MEMORY
+		CMP.B	#G_1RECORD_SIZE, R0L
+		BNE	AD_DISP_PLAY_E0F
+
+		JSR	@AD_DISP_PLAY_SUB
+		MOV.B	#0, R0L
+		JMP	@AD_DISP_PLAY_E
+
+AD_DISP_PLAY_E0F:
+		MOV.B	#H'FF, R0L
+AD_DISP_PLAY_E:
+		POP.W	R2
+		POP.W	R1
+		RTS
+
+;-------------------------------------------------
+;	割り込み処理
+;-------------------------------------------------
+AD_INT:		PUSH.L	ER0			;レジスタの待避
+		PUSH.L	ER1
+		PUSH.W	R2
+		MOV.B	@G_OFF_ON, R0L
+		BNE	AD_INT_CHK
+		JMP	@AD_INT_E
+AD_INT_CHK:
+		MOV.B	@ADCSR, R0L
+		BTST	#7, R0L
+		BNE	AD_INT_S
+		JMP	@AD_INT_E
+AD_INT_S:
+		MOV.W	#OFFSET_AX_LOG, R0
+		MOV.W	R0, R1
+		ADD.W	#1, R1
+		MOV.B	#127, R2H
+AD_INT_S_L1:	MOV.B	@R1+, R2L
+		MOV.B	R2L, @R0
+		INC.W	#1, R0
+		DEC.B	R2H
+		BNE	AD_INT_S_L1
+
+		MOV.W	@AX_X3, R0
+		MOV.W	R0, @AX_X4
+		MOV.W	@AX_X2, R0
+		MOV.W	R0, @AX_X3
+		MOV.W	@AX_X1, R0
+		MOV.W	R0, @AX_X2
+		MOV.W	@AX_Y3, R0
+		MOV.W	R0, @AX_Y4
+		MOV.W	@AX_Y2, R0
+		MOV.W	R0, @AX_Y3
+		MOV.W	@AX_Y1, R0
+		MOV.W	R0, @AX_Y2
+
+		BCLR	#5, @ADCSR		; ADST 変換終了
+		MOV.W	@ADDRB, R0
+		MOV.W	R0, @AX_X1
+		MOV.W	@AX_XZ, E0
+		SUB.W	E0, R0			; 表示用にオフセット
+		MOV.W	#OFFSET_AX_LAST, R1	; 表示用に記録するアドレス
+		MOV.B	R0H, @R1		; 表示用に記録
+		MOV.W	@ADDRA, R0
+		MOV.W	R0, @AX_Y1
+		MOV.W	@AX_YZ, E0
+		SUB.W	E0, R0			; 表示用にオフセット
+		MOV.W	#OFFSET_AY_LAST, R1	; 表示用に記録するアドレス
+		MOV.B	R0H, @R1		; 表示用に記録
+
+		MOV.W	@AX_X1, R0
+		MOV.W	#0, E0
+		MOV.W	E0, E1
+		MOV.W	@AX_X2, R1
+		ADD.L	ER1, ER0
+		MOV.W	@AX_X3, R1
+		ADD.L	ER1, ER0
+		MOV.W	@AX_X4, R1
+		ADD.L	ER1, ER0
+		SHAR.L	ER0
+		SHAR.L	ER0
+		MOV.W	R0, @AX_X
+		MOV.W	@AX_Y1, R0
+		MOV.W	#0, E0
+		MOV.W	E0, E1
+		MOV.W	@AX_Y2, R1
+		ADD.L	ER1, ER0
+		MOV.W	@AX_Y3, R1
+		ADD.L	ER1, ER0
+		MOV.W	@AX_Y4, R1
+		ADD.L	ER1, ER0
+		SHAR.L	ER0
+		SHAR.L	ER0
+		MOV.W	R0, @AX_Y
+		JSR	@SET_MEM_G_DATA
+		JSR	@SET_MEM_MULTI_DATA
+		BCLR	#7, @ADCSR
+
+		MOV.W	@AX_XZ, R0
+		BNE	AD_INT_E
+		MOV.W	@AX_X, R0
+		MOV.W	R0, @AX_XZ
+		MOV.W	@AX_Y, R0
+		MOV.W	R0, @AX_YZ
+AD_INT_E:
+		POP.W	R2
+		POP.L	ER1			;レジスタの復帰
+		POP.L	ER0			;レジスタの復帰
+		RTE				;割り込みからの復帰
+
+;=================================================
+	.SECTION PDATA, DATA, ALIGN=2
+
+AX_X1		.RES.W	1
+AX_X2		.RES.W	1
+AX_X3		.RES.W	1
+AX_X4		.RES.W	1
+AX_Y1		.RES.W	1
+AX_Y2		.RES.W	1
+AX_Y3		.RES.W	1
+AX_Y4		.RES.W	1
+
+AX_X		.RES.W	1
+AX_Y		.RES.W	1
+AX_XZ		.RES.W	1		; ZERO POINT
+AX_YZ		.RES.W	1		; ZERO POINT
+
+G_OFF_ON	.RES.B	1
+		.ALIGN 2
+
+I2C_RECORD	.RES.W	3
+		.ALIGN 2
+
+OFFSET_AX_LOG	.RES.B	63
+OFFSET_AX_LAST	.RES.B	1
+OFFSET_AY_LOG	.RES.B	63
+OFFSET_AY_LAST	.RES.B	1
+
+	.END

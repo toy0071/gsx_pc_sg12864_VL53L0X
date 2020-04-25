@@ -1,0 +1,345 @@
+;===== HALO_IRQ.ASM ========================================
+;	IRQ割り込みイッチ処理　（P14-P17)
+;				toya@v007.vaio.ne.jp
+;	CPU H8/3664
+
+	.FORM	COL=120
+	.PRINT	LIST		;アセンブル時にリストファイルを出力する
+	.CPU 300HN		;ＣＰＵの指定
+
+	.INCLUDE "io.inc"
+
+	.IMPORT		EEPROM_REC_CHK
+
+	.EXPORT		IRQ_PARAM_INIT
+	.EXPORT		IRQ_INIT
+
+	.EXPORT		SW_CHATTERING_CHK
+	.EXPORT		IRQ_KEEP
+	.EXPORT		IRQ0_START
+	.EXPORT		IRQ1_START
+	.EXPORT		IRQ2_START
+	.EXPORT		IRQ3_START
+
+	.EXPORT		READ_SW0
+	.EXPORT		READ_SW1
+	.EXPORT		READ_SW2
+	.EXPORT		READ_SW3
+	.EXPORT		GET_MGS_MODE
+	.EXPORT		TURN_MGS_MODE
+
+;--- DEFINE SW PARAM ---
+DEF_SW_VOID_CNT		.EQU	122	; 200ms   = 1.64ms * 123
+DEF_SW_WAIT_CNT		.EQU	12	; 19.68ms = 1.64ms * 12
+DEF_SW3_WAIT_CNT	.EQU	6	; 9.8ms   = 1.64ms * 6
+DEF_SENSOR_VOID_CNT	.EQU	250	; 410ms   = 1.64ms * 250
+
+;--- ASSIGN IRQ CONTROL FLAG ---
+IEN3		.BEQU	3,IENR1		;IRQ3 イネーブルビット
+IEN2		.BEQU	2,IENR1		;IRQ2 イネーブルビット
+IEN1		.BEQU	1,IENR1		;IRQ1 イネーブルビット
+IEN0		.BEQU	0,IENR1		;IRQ0 イネーブルビット
+IRRI3		.BEQU	3,IRR1		;IRQ3 割り込みフラグビット
+IRRI2		.BEQU	2,IRR1		;IRQ2 割り込みフラグビット
+IRRI1		.BEQU	1,IRR1		;IRQ1 割り込みフラグビット
+IRRI0		.BEQU	0,IRR1		;IRQ0 割り込みフラグビット
+
+;=================================================
+	.SECTION ROM, CODE, ALIGN=2
+;-------------------------------------------------
+;	初期化処理
+;-------------------------------------------------
+IRQ_PARAM_INIT:	PUSH.W	R0
+		MOV.B	#0, R0L
+		MOV.B	R0L, @SW_FLAG
+		MOV.W	R0, @SW0_VOID_CNT
+		MOV.W	R0, @SW1_VOID_CNT
+		MOV.W	R0, @SW2_VOID_CNT
+		MOV.W	R0, @SW3_VOID_CNT
+		MOV.B	R0L, @SW0_WAIT_CNT
+		MOV.B	R0L, @SW1_WAIT_CNT
+		MOV.B	R0L, @SW2_WAIT_CNT
+		MOV.B	R0L, @SW3_WAIT_CNT
+		MOV.B	#1, R0L
+		MOV.B	R0L, @MGS_MODE
+		POP.W	R0
+		RTS
+
+IRQ_INIT:	MOV.B	@PMR1,R0L		;
+		AND.B	#B'00001111,R0L
+		OR.B	#B'11110000,R0L		; IRQ : P14-15をIRQ0,1,2に設定
+		MOV.B	R0L, @PMR1		; P22は、PMR1でよい。
+
+;;;		MOV.B	#B'00000000,R0L		; IRQ0-3 立ち下がりエッジ検出（SWはPUSH:ON）
+		MOV.B	#B'00001111,R0L		; IRQ0-2 立ち上がりエッジ検出（SWはPUSH:ON）
+		MOV.B	R0L,@IEGR1		; 押した瞬間を検知
+		NOP
+		BSET	IEN3
+		NOP
+		BSET	IEN2
+		NOP
+		BSET	IEN1
+		NOP
+		BSET	IEN0
+		RTS
+
+;-------------------------------------------------
+;	SW_CHATTERING処理
+;-------------------------------------------------
+SW_CHATTERING_CHK:
+		PUSH.L	ER0
+		MOV.W	@SW0_VOID_CNT, R0
+		BEQ	SW1_CHATTERING_CHK
+		DEC.W	#1, R0
+		MOV.W	R0, @SW0_VOID_CNT
+		BNE	SW1_CHATTERING_CHK
+		BCLR	IRRI0			;割り込みフラグをクリア
+		BSET	IEN0			;割り込み再開
+SW1_CHATTERING_CHK:
+		MOV.W	@SW1_VOID_CNT, R0
+		BEQ	SW2_CHATTERING_CHK
+		DEC.W	#1, R0
+		MOV.W	R0, @SW1_VOID_CNT
+		BNE	SW2_CHATTERING_CHK
+		BCLR	IRRI1			;割り込みフラグをクリア
+		BSET	IEN1			;割り込み再開
+SW2_CHATTERING_CHK:
+		MOV.W	@SW2_VOID_CNT, R0
+		BEQ	SW3_CHATTERING_CHK
+		DEC.W	#1, R0
+		MOV.W	R0, @SW2_VOID_CNT
+		BNE	SW3_CHATTERING_CHK
+		BCLR	IRRI2			;割り込みフラグをクリア
+		BSET	IEN2			;割り込み再開
+SW3_CHATTERING_CHK:
+		MOV.W	@SW3_VOID_CNT, R0
+		BEQ	SW_CHATTERING_CHK_E
+		DEC.W	#1, R0
+		MOV.W	R0, @SW3_VOID_CNT
+		BNE	SW_CHATTERING_CHK_E
+		BCLR	IRRI3			;割り込みフラグをクリア
+		MOV.B	@MGS_MODE, R0L
+		CMP.B	#0, R0L
+		BEQ	SW_CHATTERING_CHK_E
+		BSET	IEN3			;割り込み再開
+SW_CHATTERING_CHK_E:
+		POP.L	ER0
+		RTS
+
+IRQ_KEEP:	PUSH.W	R0
+		PUSH.W	R1
+
+		MOV.B	@SW1_WAIT_CNT, R0L
+		BEQ	IRQ1_KEEP_E
+		DEC.B	R0L
+		MOV.B	R0L, @SW1_WAIT_CNT
+		MOV.B	@PDR1, R1L
+		BTST	#5,R1L
+		BNE	IRQ1_ON_KEEP
+		MOV.B	#0,R0L
+		MOV.B	R0L, @SW1_WAIT_CNT
+		JMP	@IRQ1_KEEP_E
+IRQ1_ON_KEEP:	MOV.B	@SW1_WAIT_CNT, R0L
+		CMP.B	#0, R0L
+		BNE	IRQ1_KEEP_E
+		MOV.B	@SW_FLAG, R0L
+		BSET	#1, R0L
+		MOV.B	R0L, @SW_FLAG
+IRQ1_KEEP_E:
+
+		MOV.B	@SW2_WAIT_CNT, R0L
+		BEQ	IRQ2_KEEP_E
+		DEC.B	R0L
+		MOV.B	R0L, @SW2_WAIT_CNT
+		MOV.B	@PDR1, R1L
+		BTST	#6,R1L
+		BNE	IRQ2_ON_KEEP
+		MOV.B	#0,R0L
+		MOV.B	R0L, @SW2_WAIT_CNT
+		JMP	@IRQ2_KEEP_E
+IRQ2_ON_KEEP:	MOV.B	@SW2_WAIT_CNT, R0L
+		CMP.B	#0, R0L
+		BNE	IRQ2_KEEP_E
+		MOV.B	@SW_FLAG, R0L
+		BSET	#2, R0L
+		MOV.B	R0L, @SW_FLAG
+IRQ2_KEEP_E:
+
+		MOV.B	@SW3_WAIT_CNT, R0L
+		BEQ	IRQ3_KEEP_E
+		DEC.B	R0L
+		MOV.B	R0L, @SW3_WAIT_CNT
+		MOV.B	@PDR1, R1L
+		MOV.B	@PMR1,R0L		;
+		AND.B	#B'01111111,R0L
+		MOV.B	R0L, @PMR1
+		MOV.B	@PCR1,R0L		;
+		AND.B	#B'01111111,R0L
+		MOV.B	R0L, @PCR1
+		NOP
+		NOP
+		MOV.B	@PDR1, R1L
+		MOV.B	@PMR1,R0L		;
+		AND.B	#B'01111111,R0L
+		OR.B	#B'10000000,R0L	
+		MOV.B	R0L, @PMR1
+		BTST	#7,R1L
+		BNE	IRQ3_ON_KEEP
+		MOV.B	#0,R0L
+		MOV.B	R0L, @SW3_WAIT_CNT
+		JMP	@IRQ3_KEEP_E
+IRQ3_ON_KEEP:	MOV.B	@SW3_WAIT_CNT, R0L
+		CMP.B	#0, R0L
+		BNE	IRQ3_KEEP_E
+		MOV.B	@SW_FLAG, R0L
+		BSET	#3, R0L
+		MOV.B	R0L, @SW_FLAG
+IRQ3_KEEP_E:
+		POP.W	R1
+		POP.W	R0
+		RTS
+
+
+;-------------------------------------------------
+;	READ SWITCH STATE, THEN CLEAR.
+;-------------------------------------------------
+READ_SW0:	PUSH.W	R0
+		MOV.B	@SW_FLAG, R0L
+		BLD.B	#0, R0L
+		BCLR.B	#0, R0L
+		MOV.B	R0L, @SW_FLAG
+		POP.W	R0
+		RTS
+
+READ_SW1:	PUSH.W	R0
+		MOV.B	@SW_FLAG, R0L
+		BLD.B	#1, R0L
+		BCLR.B	#1, R0L
+		MOV.B	R0L, @SW_FLAG
+		POP.W	R0
+		RTS
+
+READ_SW2:	PUSH.W	R0
+		MOV.B	@SW_FLAG, R0L
+		BLD.B	#2, R0L
+		BCLR.B	#2, R0L
+		MOV.B	R0L, @SW_FLAG
+		POP.W	R0
+		RTS
+
+READ_SW3:	PUSH.W	R0
+		MOV.B	@SW_FLAG, R0L
+		BLD.B	#3, R0L
+		BCLR.B	#3, R0L
+		MOV.B	R0L, @SW_FLAG
+		POP.W	R0
+		RTS
+
+GET_MGS_MODE:
+		MOV.B	@MGS_MODE, R0L
+		RTS
+
+TURN_MGS_MODE:
+		MOV.B	@MGS_MODE, R0L
+		INC.B	R0L
+		CMP.B	#3, R0L
+		BNE	TURN_MGS_MODE_SET
+		MOV.B	#0, R0L
+TURN_MGS_MODE_SET:
+		MOV.B	R0L, @MGS_MODE
+		CMP.B	#0, R0L
+		BEQ	TURN_MGS_MODE_OFF
+		BSET	IEN3			; 割り込み開始
+		JMP	@TURN_MGS_MODE_E
+TURN_MGS_MODE_OFF:
+		BCLR	IEN3			; 割り込み禁止
+TURN_MGS_MODE_E:
+		RTS
+
+;=================================================
+	.SECTION INT_CODE, CODE, ALIGN=2
+;-------------------------------------------------
+;	割り込み処理
+;-------------------------------------------------
+IRQ0_START:	PUSH.L	ER0			;レジスタの待避
+		JSR	@EEPROM_REC_CHK		; REC中は無効
+		BCS	IRQ0_E
+
+		BCLR	IEN0			;割り込み停止
+		MOV.B	@SW_FLAG, R0L
+		BSET.B	#0, R0L
+		MOV.B	R0L, @SW_FLAG
+
+		MOV.W	#DEF_SW_VOID_CNT, R0	;チャタリング防止
+		MOV.W	R0, @SW0_VOID_CNT
+IRQ0_E:
+		BCLR	IRRI0			;割り込みフラグをクリア
+		POP.L	ER0			;レジスタの復帰
+		RTE				;割り込みからの復帰
+
+IRQ1_START:	PUSH.L	ER0			;レジスタの待避
+		JSR	@EEPROM_REC_CHK		; REC中は無効
+		BCS	IRQ1_E
+
+		BCLR	IEN1			;割り込み停止
+		MOV.B	#DEF_SW_WAIT_CNT, R0L
+		MOV.B	R0L, @SW1_WAIT_CNT
+
+		MOV.W	#DEF_SW_VOID_CNT, R0	;チャタリング防止
+		MOV.W	R0, @SW1_VOID_CNT
+
+IRQ1_E:
+		BCLR	IRRI1			;割り込みフラグをクリア
+		POP.L	ER0			;レジスタの復帰
+		RTE				;割り込みからの復帰
+
+IRQ2_START:	PUSH.L	ER0			;レジスタの待避
+		BCLR	IEN2			;割り込み停止
+		BCLR	IRRI2			;割り込みフラグをクリア
+
+		MOV.B	#DEF_SW_WAIT_CNT, R0L
+		MOV.B	R0L, @SW2_WAIT_CNT
+
+		MOV.W	#DEF_SW_VOID_CNT, R0	;チャタリング防止
+		MOV.W	R0, @SW2_VOID_CNT
+
+		POP.L	ER0			;レジスタの復帰
+		RTE				;割り込みからの復帰
+
+IRQ3_START:	PUSH.L	ER0			;レジスタの待避
+		BCLR	IEN3			;割り込み停止
+		BCLR	IRRI3			;割り込みフラグをクリア
+
+		MOV.B	@MGS_MODE, R0L
+		CMP.B	#2, R0L			; ON2 : 信号状態確認モード
+		BNE	IRQ3_START_NOWAIT
+		MOV.B	#DEF_SW3_WAIT_CNT, R0L
+		MOV.B	R0L, @SW3_WAIT_CNT
+		JMP	@IRQ3_VOID_CNT
+IRQ3_START_NOWAIT:
+		MOV.B	@SW_FLAG, R0L
+		BSET	#3, R0L
+		MOV.B	R0L, @SW_FLAG
+IRQ3_VOID_CNT:
+		MOV.W	#DEF_SENSOR_VOID_CNT, R0  ;ノイズ除去
+		MOV.W	R0, @SW3_VOID_CNT
+
+		POP.L	ER0			;レジスタの復帰
+		RTE				;割り込みからの復帰
+
+;=================================================
+	.SECTION PDATA, DATA, ALIGN=2
+
+SW_FLAG		.DATA.B	0
+MGS_MODE	.RES.B	1
+		.ALIGN	2
+SW0_VOID_CNT	.RES.W	1
+SW1_VOID_CNT	.RES.W	1
+SW2_VOID_CNT	.RES.W	1
+SW3_VOID_CNT	.RES.W	1
+SW0_WAIT_CNT	.RES.B	1
+SW1_WAIT_CNT	.RES.B	1
+SW2_WAIT_CNT	.RES.B	1
+SW3_WAIT_CNT	.RES.B	1
+
+	.END
